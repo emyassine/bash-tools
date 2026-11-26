@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" -eq 5 && "$1" == ACCEPT && "$2" == '0.0.0.0/0' && "$4" == TCP ]]
+printf "RULE='1' ACTION='%s' PROTOCOL='%s' PORT='%s' IP='%s' COMMENT='%s'\n" \
+    "$1" "$4" "$3" "$2" "$5" >>"$MDBM_TEST_HESTIA_RULES_FILE"
+printf '%s\n' "$*" >>"$FAKE_DB_DIR/hestia.log"

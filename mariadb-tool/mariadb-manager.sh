@@ -4,7 +4,7 @@
 # remote access. A separate command can remove any selected remote account.
 set -Eeuo pipefail
 
-VERSION='2.4.0'
+VERSION='2.5.0'
 EDITION='2026'
 RELEASED='November 26, 2026'
 
@@ -61,6 +61,7 @@ Usage:
   ${SCRIPT_NAME} grant        Grant access to one database
   ${SCRIPT_NAME} revoke       Revoke a grant managed by this tool
   ${SCRIPT_NAME} remove-remote Remove a remote account and all its grants
+  ${SCRIPT_NAME} enable-network Configure MariaDB listening and the Hestia firewall
   ${SCRIPT_NAME} --version    Print version information
   ${SCRIPT_NAME} --about      Print the portable tool guide
   ${SCRIPT_NAME} --help       Show this help
@@ -75,9 +76,9 @@ ${SCRIPT_NAME} ${VERSION} - MariaDB Manager
 
 Purpose
   Inspect MariaDB accounts and databases, grant remote access to one database,
-  revoke grants managed by this tool, or remove an existing remote account.
-  The tool changes MariaDB accounts and grants only. It does not edit application
-  configuration, MariaDB network settings, services, or firewalls.
+  revoke managed grants, remove a remote account, or configure server-side
+  MariaDB listening and the Hestia firewall. It never edits app configuration
+  or the provider firewall.
 
 Commands
   ${SCRIPT_NAME}              Open the interactive menu
@@ -89,6 +90,7 @@ Commands
   ${SCRIPT_NAME} grant        Grant access to one database
   ${SCRIPT_NAME} revoke       Revoke a database grant recorded by this tool
   ${SCRIPT_NAME} remove-remote Remove a selected remote account and all its grants
+  ${SCRIPT_NAME} enable-network Enable MariaDB remote listening and Hestia TCP access
   ${SCRIPT_NAME} --version    Print the version
   ${SCRIPT_NAME} --about      Print this guide
   ${SCRIPT_NAME} --help       Print concise command help
@@ -115,9 +117,12 @@ Revoke and remove behavior
     and every grant attached to it. A same-name user@localhost is untouched.
 
 Network requirements
-  - MariaDB must listen on a reachable non-loopback address for remote access.
-  - The server firewall and any provider firewall must allow TCP to the MariaDB
-    port. This tool only diagnoses these settings; it never changes them.
+  - 'enable-network' backs up and updates MariaDB bind-address, restarts MariaDB,
+    and adds a Hestia ACCEPT rule for TCP on its configured port from 0.0.0.0/0.
+    It requires typed confirmation.
+  - Contabo's provider firewall is outside the server. If assigned, add an
+    inbound TCP rule for the MariaDB port from 0.0.0.0/0 in Contabo before
+    assigning it. This tool cannot change provider firewall settings.
 
 Requirements and state
   - Bash, root access, the 'mariadb' client with local root socket access, and
@@ -140,7 +145,7 @@ case "${1:-}" in
     --help|-h) usage; exit 0 ;;
     --about) about; exit 0 ;;
     ''|menu) COMMAND='menu' ;;
-    databases|users|remote|info|diagnose|grant|revoke|remove-remote) COMMAND="$1" ;;
+    databases|users|remote|info|diagnose|grant|revoke|remove-remote|enable-network) COMMAND="$1" ;;
     *) err "Unknown option: $1"; usage >&2; exit 2 ;;
 esac
 
@@ -160,7 +165,7 @@ db_query() {
 umask 077
 
 case "$COMMAND" in
-    menu|grant|revoke|remove-remote)
+    menu|grant|revoke|remove-remote|enable-network)
         [[ -n "$TEST_MODE" || -t 0 ]] || die 'This command is interactive and needs a terminal.'
         exec 9>"$LOCK_FILE" || die "Cannot open lock file: $LOCK_FILE"
         flock -n 9 || die 'Another copy of this script is already running.'
@@ -515,7 +520,7 @@ view_remote() {
     printf '\n'
     hint 'Option 6 revokes only database grants tracked by this tool.'
     hint 'Option 9 removes a selected remote account and all its grants after exact-name confirmation.'
-    hint 'This tool only manages the MariaDB side. Network listening and firewall rules are separate (see: diagnose).'
+    hint 'Option 8 diagnoses network reachability; option 10 configures MariaDB and the Hestia firewall.'
 }
 
 view_server() {
@@ -525,7 +530,7 @@ view_server() {
         printf '    %-20s %s\n' "$name" "$value"
     done < <(db_query -e "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('version', 'hostname', 'port', 'bind_address', 'skip_networking', 'socket', 'datadir');")
     printf '\n'
-    hint "Run '${SCRIPT_NAME} diagnose' to check whether remote connections can reach this server."
+    hint "Run '${SCRIPT_NAME} diagnose' to inspect reachability or 'enable-network' to configure server-side access."
 }
 
 # ------------------------------------------------------ network diagnosis ---
@@ -563,12 +568,12 @@ network_verdict() {
         if (( public == 0 && loopback == 1 )); then
             warn "MariaDB listens only on the loopback interface. Remote connections CANNOT work, even with a valid grant."
             note "To accept remote connections you must set bind-address in the MariaDB configuration"
-            note "and restart the service, then restrict port ${port:-3306} with your firewall."
+            note "and restart the service. Then allow TCP ${port:-3306} in Hestia and in any assigned provider firewall."
         else
-            ok "MariaDB listens on a non-loopback address. Make sure your firewall only allows trusted sources."
+            ok 'MariaDB listens on a non-loopback address. Verify Hestia and provider firewall rules.'
         fi
     fi
-    hint 'This tool never changes bind-address, the service or the firewall.'
+    hint 'This diagnosis is read-only; option 10 configures MariaDB and Hestia. Provider firewall settings stay external.'
 }
 
 diagnose_flow() {
@@ -586,6 +591,130 @@ diagnose_flow() {
     printf '\n'
     info "Accounts allowed from any host: ${remote_count}"
     hint 'A grant is only half of remote access: the server must also listen on a reachable address.'
+}
+
+# Configure server-side remote access. The provider firewall (for example,
+# Contabo's panel firewall) cannot be changed from this host-side script.
+enable_network_flow() {
+    local port skip bind config_file service hestia_add hestia_root rules_file
+    local rule_state='NEEDS ADDITION' change_bind='NO' confirmation backup bind_after
+    local -a config_files=() config_search_roots=(/etc/mysql /etc/my.cnf /etc/my.cnf.d)
+
+    title 'Enable MariaDB remote network access'
+    port="$(show_var port)"
+    skip="$(show_var skip_networking)"
+    bind="$(show_var bind_address)"
+    [[ "$port" =~ ^[0-9]+$ ]] || { err 'Could not determine MariaDB TCP port.'; return 1; }
+    if [[ "${skip^^}" == 'ON' ]]; then
+        err 'skip_networking is ON. Disable it in MariaDB configuration first; nothing was changed.'
+        return 1
+    fi
+
+    if [[ -n "$TEST_MODE" && -n "${MDBM_TEST_CONFIG_ROOT:-}" ]]; then
+        config_search_roots=("$MDBM_TEST_CONFIG_ROOT")
+    fi
+    mapfile -t config_files < <(grep -rlE '^[[:space:]]*bind[-_]address[[:space:]]*=' "${config_search_roots[@]}" 2>/dev/null | sort -u)
+    if (( ${#config_files[@]} != 1 )); then
+        err "Expected one MariaDB config file with an active bind-address; found ${#config_files[@]}. Nothing was changed."
+        if (( ${#config_files[@]} > 0 )); then printf '    %s\n' "${config_files[@]}"; fi
+        return 1
+    fi
+    config_file="${config_files[0]}"
+
+    if [[ "$bind" == 127.* || "$bind" == 'localhost' || "$bind" == '::1' || -z "$bind" ]]; then
+        change_bind='YES'
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        err 'systemctl is unavailable. Nothing was changed.'
+        return 1
+    fi
+    if systemctl cat mariadb.service >/dev/null 2>&1; then
+        service='mariadb'
+    elif systemctl cat mysql.service >/dev/null 2>&1; then
+        service='mysql'
+    else
+        err 'Could not find a MariaDB or MySQL systemd service. Nothing was changed.'
+        return 1
+    fi
+
+    hestia_add="$(command -v v-add-firewall-rule || true)"
+    [[ -n "$hestia_add" ]] || [[ ! -x /usr/local/hestia/bin/v-add-firewall-rule ]] || hestia_add='/usr/local/hestia/bin/v-add-firewall-rule'
+    if [[ -z "$hestia_add" ]]; then
+        err 'Hestia firewall CLI was not found. Nothing was changed.'
+        return 1
+    fi
+    hestia_root="$(dirname -- "$(dirname -- "$hestia_add")")"
+    if [[ -r /etc/hestiacp/hestia.conf ]]; then
+        local configured_hestia
+        configured_hestia="$(sed -n -E "s/^[[:space:]]*(export[[:space:]]+)?HESTIA=['\"]?([^'\"]+)['\"]?.*$/\2/p" /etc/hestiacp/hestia.conf | head -n 1)"
+        [[ -z "$configured_hestia" ]] || hestia_root="$configured_hestia"
+    fi
+    rules_file="${hestia_root}/data/firewall/rules.conf"
+    if [[ -n "$TEST_MODE" && -n "${MDBM_TEST_HESTIA_RULES_FILE:-}" ]]; then
+        rules_file="$MDBM_TEST_HESTIA_RULES_FILE"
+    fi
+    if [[ -r "$rules_file" ]] && grep -Eq "ACTION='ACCEPT'.*PROTOCOL='TCP'.*PORT='(0|${port})'.*IP='0\\.0\\.0\\.0/0'" "$rules_file"; then
+        rule_state='ALREADY PRESENT'
+    fi
+
+    printf '\n  Plan:\n'
+    printf '    MariaDB bind-address: %s -> %s\n' "${bind:-unknown}" "$([[ "$change_bind" == 'YES' ]] && printf '0.0.0.0' || printf 'unchanged')"
+    printf '    MariaDB service:      restart %s\n' "$service"
+    printf '    Hestia firewall:      TCP %s from 0.0.0.0/0 (%s)\n' "$port" "$rule_state"
+    warn 'Contabo provider firewall is not changed by this command.'
+    note "If you assign a Contabo firewall, add ACCEPT TCP ${port} from 0.0.0.0/0 there before assigning it."
+    printf '\n'
+    hint 'This exposes the MariaDB TCP port to all IPv4 sources. Database grants still control which data an account can access.'
+    ask confirmation 'Type ENABLE NETWORK to continue:' || return $?
+    if [[ "$confirmation" != 'ENABLE NETWORK' ]]; then
+        warn 'Confirmation did not match. Nothing was changed.'
+        return 0
+    fi
+
+    if [[ "$change_bind" == 'YES' ]]; then
+        backup="${config_file}.mariadb-manager.$(date +%Y%m%d%H%M%S).bak"
+        if ! cp -a -- "$config_file" "$backup"; then
+            err "Could not back up ${config_file}. Nothing was changed."
+            return 1
+        fi
+        if ! sed -E -i 's/^([[:space:]]*)bind[-_]address[[:space:]]*=.*/\1bind-address = 0.0.0.0/' "$config_file"; then
+            cp -a -- "$backup" "$config_file" || true
+            err "Could not update ${config_file}; restored from backup where possible."
+            return 1
+        fi
+        if ! systemctl restart "$service"; then
+            cp -a -- "$backup" "$config_file" || err 'Could not restore the MariaDB configuration backup.'
+            systemctl restart "$service" || err 'MariaDB failed to restart with the restored configuration.'
+            err 'MariaDB restart failed. The original configuration was restored where possible.'
+            return 1
+        fi
+        bind_after="$(show_var bind_address)"
+        if [[ "$bind_after" != '0.0.0.0' ]]; then
+            cp -a -- "$backup" "$config_file" || err 'Could not restore the MariaDB configuration backup.'
+            systemctl restart "$service" || err 'MariaDB failed to restart with the restored configuration.'
+            err "MariaDB still reports bind_address=${bind_after:-unknown}; restored the previous configuration where possible."
+            return 1
+        fi
+        ok "MariaDB now listens on 0.0.0.0:${port}. Backup: ${backup}"
+    else
+        info "MariaDB already listens on ${bind}; no bind-address change is needed."
+    fi
+
+    if [[ "$rule_state" == 'NEEDS ADDITION' ]]; then
+        if ! "$hestia_add" ACCEPT 0.0.0.0/0 "$port" TCP MariaDB_remote_access; then
+            if [[ "$change_bind" == 'YES' ]]; then
+                cp -a -- "$backup" "$config_file" || err 'Could not restore the MariaDB configuration backup.'
+                systemctl restart "$service" || err 'MariaDB failed to restart with the restored configuration.'
+            fi
+            err 'Hestia could not add the firewall rule. MariaDB configuration was restored where possible.'
+            return 1
+        fi
+        ok "Added the Hestia firewall rule for TCP ${port} from any IPv4 address."
+    else
+        info 'The matching Hestia firewall rule already exists.'
+    fi
+    network_verdict
+    warn 'If the Contabo firewall is assigned, it still needs its own inbound TCP rule.'
 }
 
 # ------------------------------------------------------------ grant flow ----
@@ -1001,6 +1130,7 @@ main_menu() {
         printf '    %s7)%s Server information\n' "$CYAN" "$RESET"
         printf '    %s8)%s Network diagnosis (can remote clients connect?)\n' "$CYAN" "$RESET"
         printf '    %s9)%s Remove an existing remote account (drop account + all grants)\n' "$CYAN" "$RESET"
+        printf '   %s10)%s Enable MariaDB remote access and Hestia firewall rule\n' "$CYAN" "$RESET"
         printf '    %sq)%s Quit\n\n' "$CYAN" "$RESET"
         ask choice 'Choice:' && rc=0 || rc=$?
         if (( rc == 10 )); then hint "You are already at the main menu. Type 'quit' to exit."; continue; fi
@@ -1014,6 +1144,7 @@ main_menu() {
             7) view_server ;;
             8) diagnose_flow ;;
             9) remove_remote_account_flow || true ;;
+            10) enable_network_flow || true ;;
             *) err "Invalid choice: ${choice}" ;;
         esac
     done
@@ -1029,4 +1160,5 @@ case "$COMMAND" in
     grant)     grant_flow ;;
     revoke)    revoke_flow ;;
     remove-remote) remove_remote_account_flow ;;
+    enable-network) enable_network_flow ;;
 esac

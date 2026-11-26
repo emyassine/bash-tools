@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    cat)
+        [[ "${2:-}" == 'mariadb.service' ]]
+        ;;
+    restart)
+        [[ "${2:-}" == 'mariadb' ]]
+        bind="$(sed -n -E 's/^[[:space:]]*bind[-_]address[[:space:]]*=[[:space:]]*([^[:space:]]+).*$/\1/p' "$MDBM_TEST_CONFIG_ROOT/50-server.cnf" | tail -n 1)"
+        [[ -n "$bind" ]]
+        sed -i -E "s/^bind_address[[:space:]].*/bind_address\t${bind}/" "$FAKE_DB_DIR/variables"
+        ;;
+    *) exit 1 ;;
+esac

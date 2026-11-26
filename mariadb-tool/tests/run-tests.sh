@@ -18,14 +18,17 @@ new_env() {
     T="$(mktemp -d)"
     cp "$SCRIPT" "$T/mariadb-manager.sh"
     export FAKE_DB_DIR="$T/db" MDBM_TEST_MODE=1 HIST="$T/mariadb-manager.sh.history"
-    mkdir -p "$T/bin"; cp "$HERE"/fake-bin/mariadb "$HERE"/fake-bin/ss "$T/bin/"; chmod +x "$T"/bin/*
+    export MDBM_TEST_CONFIG_ROOT="$T/mysql" MDBM_TEST_HESTIA_RULES_FILE="$T/hestia-rules.conf"
+    mkdir -p "$T/bin"; cp "$HERE"/fake-bin/mariadb "$HERE"/fake-bin/ss "$HERE"/fake-bin/systemctl "$HERE"/fake-bin/v-add-firewall-rule "$T/bin/"; chmod +x "$T"/bin/*
     export PATH="$T/bin:$ORIG_PATH"
     unset FAKE_FAIL_ON FAKE_SLEEP_AFTER_GRANT FAKE_BREAK_HISTORY FAKE_SS_ADDR
-    mkdir -p "$FAKE_DB_DIR"
+    mkdir -p "$FAKE_DB_DIR" "$MDBM_TEST_CONFIG_ROOT"
     printf 'shopdb\t12\t1.50\nblogdb\t5\t0.20\nunder_score\t1\t0.01\nunderXscore\t1\t0.01\n' >"$FAKE_DB_DIR/databases"
     printf 'root\tlocalhost\napp\tlocalhost\nblog\tlocalhost\n' >"$FAKE_DB_DIR/users"
     printf 'version\t11.4.0-fake\nhostname\ttesthost\nport\t3306\nbind_address\t127.0.0.1\nskip_networking\tOFF\n' >"$FAKE_DB_DIR/variables"
     : >"$FAKE_DB_DIR/dbgrants"; : >"$FAKE_DB_DIR/tableprivs"; : >"$FAKE_DB_DIR/globals"; : >"$FAKE_DB_DIR/sql.log"
+    printf '[mysqld]\nbind-address = 127.0.0.1\n' >"$MDBM_TEST_CONFIG_ROOT/50-server.cnf"
+    : >"$MDBM_TEST_HESTIA_RULES_FILE"
 }
 run_cli() { # run_cli "INPUT" ARGS...   (INPUT uses printf %b escapes)
     local input="$1"; shift
@@ -203,16 +206,30 @@ assert 'incorrect confirmation executes no drop'    log_lacks '^DROP USER'
 
 section '14. Portable about and CLI help'
 new_env; run_cli '' --about
-assert 'about identifies the current version'          out_has 'mariadb-manager.sh 2.4.0'
+assert 'about identifies the current version'          out_has 'mariadb-manager.sh 2.5.0'
 assert 'about documents database grants'              out_has 'Grant ALL PRIVILEGES on the selected database only'
 assert 'about documents full remote account removal'  out_has 'every grant attached to it'
-assert 'about documents network limits'               out_has 'firewalls'
+assert 'about documents network limits'               out_has 'firewall'
+assert 'about documents server-side network setup'    out_has 'enable-network'
+assert 'about identifies the Contabo step'             out_has 'Contabo'
 assert 'about does not connect to MariaDB'            log_lacks 'SELECT 1'
 run_cli '' --version
 assert 'version output is concise'                     out_lacks 'Grant behavior'
-assert 'version identifies 2.4.0'                     out_has '2.4.0'
+assert 'version identifies 2.5.0'                     out_has '2.5.0'
 run_cli '' --help
 assert 'help points to the portable about guide'      out_has '--about'
+
+section '15. Server-side network setup'
+new_env; run_cli 'ENABLE NETWORK\n' enable-network
+assert 'bind-address is updated'                      grep -Eq '^bind-address = 0.0.0.0$' "$MDBM_TEST_CONFIG_ROOT/50-server.cnf"
+assert 'MariaDB service restart applied the setting'  grep -Fxq $'bind_address\t0.0.0.0' "$FAKE_DB_DIR/variables"
+assert 'Hestia accepts port 3306 from any IPv4 source' grep -Fq "ACTION='ACCEPT' PROTOCOL='TCP' PORT='3306' IP='0.0.0.0/0'" "$MDBM_TEST_HESTIA_RULES_FILE"
+assert 'Contabo remains a separate manual step'        out_has 'Contabo provider firewall is not changed'
+run_cli 'ENABLE NETWORK\n' enable-network
+assert 'repeated setup does not duplicate the Hestia rule' test "$(wc -l <"$MDBM_TEST_HESTIA_RULES_FILE")" -eq 1
+new_env; run_cli 'NO\n' enable-network
+assert 'wrong confirmation leaves bind-address unchanged' grep -Eq '^bind-address = 127.0.0.1$' "$MDBM_TEST_CONFIG_ROOT/50-server.cnf"
+assert 'wrong confirmation does not open Hestia firewall' test ! -s "$MDBM_TEST_HESTIA_RULES_FILE"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
