@@ -61,6 +61,10 @@ priv_count() { # priv_count USER DB match|other
 if [[ "$sql" == 'SELECT 1' ]]; then echo 1; exit 0; fi
 if has 'information_schema.SCHEMATA'; then cat "$D/databases"; exit 0; fi
 if has "FROM mysql.user WHERE User <> ''"; then sort -t $'\t' -k1,1 -k2,2 "$D/users"; exit 0; fi
+if has "SELECT User, Host FROM mysql.user WHERE Host <> 'localhost'"; then
+    awk -F '\t' '$2!="localhost" && $1!="" { print $1 "\t" $2 }' "$D/users" | sort -t $'\t' -k1,1 -k2,2
+    exit 0
+fi
 if has "SELECT DISTINCT User FROM mysql.user WHERE Host = 'localhost'"; then
     awk -F '\t' '$2=="localhost" && $1!="root" && $1!="mariadb.sys" && $1!="mysql" { print $1 }' "$D/users" | sort -u; exit 0
 fi
@@ -85,19 +89,19 @@ if has 'SELECT (SELECT COUNT(*) FROM mysql.db'; then
     fi
     exit 0
 fi
-re='SELECT COUNT\(\*\) FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db IN \("([^"]*)", "([^"]*)"\)'
+re='SELECT COUNT\(\*\) FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db = "([^"]*)"'
 if [[ "$nsql" =~ $re ]]; then
-    u="${BASH_REMATCH[1]}"; a="$(unq "${BASH_REMATCH[2]}")"; b="$(unq "${BASH_REMATCH[3]}")"; n=0
-    while IFS=$'\t' read -r user host pat; do
-        [[ "$user" == "$u" && "$host" == '%' && ( "$pat" == "$a" || "$pat" == "$b" ) ]] && n=$((n + 1))
+    u="${BASH_REMATCH[1]}"; pat="$(unq "${BASH_REMATCH[2]}")"; n=0
+    while IFS=$'\t' read -r user host dbpat; do
+        [[ "$user" == "$u" && "$host" == '%' && "$dbpat" == "$pat" ]] && n=$((n + 1))
     done <"$D/dbgrants"
     echo "$n"; exit 0
 fi
-re='SELECT Db FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db IN \("([^"]*)", "([^"]*)"\)'
+re='SELECT Db FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db = "([^"]*)"'
 if [[ "$nsql" =~ $re ]]; then
-    u="${BASH_REMATCH[1]}"; a="$(unq "${BASH_REMATCH[2]}")"; b="$(unq "${BASH_REMATCH[3]}")"
-    while IFS=$'\t' read -r user host pat; do
-        [[ "$user" == "$u" && "$host" == '%' && ( "$pat" == "$a" || "$pat" == "$b" ) ]] && echo "$pat"
+    u="${BASH_REMATCH[1]}"; pat="$(unq "${BASH_REMATCH[2]}")"
+    while IFS=$'\t' read -r user host dbpat; do
+        [[ "$user" == "$u" && "$host" == '%' && "$dbpat" == "$pat" ]] && echo "$dbpat"
     done <"$D/dbgrants"
     exit 0
 fi

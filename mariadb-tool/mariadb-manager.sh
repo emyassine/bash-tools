@@ -5,10 +5,10 @@
 # touches accounts and grants that this tool created.
 set -Eeuo pipefail
 
-VERSION='2.1.1'
+VERSION='2.3.0'
 EDITION='2026'
 RELEASED='November 26, 2026'
-RELEASE_NOTES='Safer exact-grant revocation; preserve later wildcard and object-level privileges; verify managed grant removal.'
+RELEASE_NOTES='Managed history now uses a strict, current record format.'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
@@ -61,8 +61,8 @@ Usage:
   ${SCRIPT_NAME} info         Show server information
   ${SCRIPT_NAME} diagnose     Check whether MariaDB accepts remote connections
   ${SCRIPT_NAME} grant        Start the "grant remote access" wizard
-  ${SCRIPT_NAME} revoke       Start the "revoke remote access" wizard
-  ${SCRIPT_NAME} migrate      Review and import a legacy history file
+  ${SCRIPT_NAME} revoke       Revoke a grant managed by this tool
+  ${SCRIPT_NAME} remove-remote Remove any existing remote account and all its grants
   ${SCRIPT_NAME} --version    Print version information
   ${SCRIPT_NAME} --help       Show this help
 
@@ -85,7 +85,7 @@ case "${1:-}" in
         ;;
     --help|-h) usage; exit 0 ;;
     ''|menu) COMMAND='menu' ;;
-    databases|users|remote|info|diagnose|grant|revoke|migrate) COMMAND="$1" ;;
+    databases|users|remote|info|diagnose|grant|revoke|remove-remote) COMMAND="$1" ;;
     *) err "Unknown option: $1"; usage >&2; exit 2 ;;
 esac
 
@@ -105,7 +105,7 @@ db_query() {
 umask 077
 
 case "$COMMAND" in
-    menu|grant|revoke|migrate)
+    menu|grant|revoke|remove-remote)
         [[ -n "$TEST_MODE" || -t 0 ]] || die 'This command is interactive and needs a terminal.'
         exec 9>"$LOCK_FILE" || die "Cannot open lock file: $LOCK_FILE"
         flock -n 9 || die 'Another copy of this script is already running.'
@@ -146,8 +146,9 @@ grant_identifier() {
     printf '`%s`' "$value"
 }
 
-remote_account_count() { # remote_account_count USER
-    db_query -e "SELECT COUNT(*) FROM mysql.user WHERE User = '$(sql_value "$1")' AND Host = '%';"
+remote_account_count() { # remote_account_count USER [HOST]
+    local host="${2:-%}"
+    db_query -e "SELECT COUNT(*) FROM mysql.user WHERE User = '$(sql_value "$1")' AND Host = '$(sql_value "$host")';"
 }
 
 # Number of privilege rows of USER@'%' that touch DATABASE: database-level rows
@@ -172,11 +173,10 @@ count_other_privileges() { # count_other_privileges USER DATABASE
 # grants may still cover the same database and must not keep this history entry
 # active after the exact grant has been removed.
 count_exact_db_rows() { # count_exact_db_rows USER DATABASE
-    local u d_raw d_esc
+    local u d_esc
     u="$(sql_value "$1")"
-    d_raw="$(sql_value "$2")"
     d_esc="$(sql_value "$(like_escape "$2")")"
-    db_query -e "SELECT COUNT(*) FROM mysql.db WHERE User = '${u}' AND Host = '%' AND Db IN ('${d_esc}', '${d_raw}');"
+    db_query -e "SELECT COUNT(*) FROM mysql.db WHERE User = '${u}' AND Host = '%' AND Db = '${d_esc}';"
 }
 
 # Returns 0 when USER@'%' has global privileges or roles, 1 when it has not,
@@ -189,15 +189,13 @@ has_broad_grants() { # has_broad_grants USER
     [[ -n "$global_grants" || -n "$role_grants" ]]
 }
 
-# Revokes the database-level rows that were stored for exactly this database
-# (escaped form, or the raw form written by older versions). Other rows,
-# including wildcard rows that happen to match, are never touched.
+# Revokes only the exact database-level row written by this version. Other
+# rows, including wildcard rows that happen to match, are never touched.
 revoke_db_rows() { # revoke_db_rows USER DATABASE
-    local u d_raw d_esc rows row ident
+    local u d_esc rows row ident
     u="$(sql_value "$1")"
-    d_raw="$(sql_value "$2")"
     d_esc="$(sql_value "$(like_escape "$2")")"
-    rows="$(db_query -e "SELECT Db FROM mysql.db WHERE User = '${u}' AND Host = '%' AND Db IN ('${d_esc}', '${d_raw}');")" || return 1
+    rows="$(db_query -e "SELECT Db FROM mysql.db WHERE User = '${u}' AND Host = '%' AND Db = '${d_esc}';")" || return 1
     [[ -n "$rows" ]] || return 0
     while IFS= read -r row; do
         [[ -n "$row" ]] || continue
@@ -218,8 +216,8 @@ show_var() { # show_var NAME
 #   REVOKED  db user time               the grant was removed
 # created = YES (account created by this tool) | NO (existing account reused)
 # pre     = NONE (verified: no privileges on that database before the grant)
-#           Older versions did not record it, so reused-account entries without
-#           pre=NONE are never revoked automatically.
+# Only records in this exact format are recognized. Earlier history formats
+# are not imported or interpreted.
 history_append() { # history_append FIELD...
     local line
     line="$(printf '%s\t' "$@")"
@@ -232,10 +230,10 @@ history_append() { # history_append FIELD...
 history_records() { # history_records active|pending
     [[ -f "$HISTORY_FILE" ]] || return 0
     awk -F '\t' -v want="$1" '
-        $1 == "PENDING" { p[$2 SUBSEP $3] = $0 }
-        $1 == "ACTIVE"  { a[$2 SUBSEP $3] = $0; delete p[$2 SUBSEP $3] }
-        $1 == "REVOKED" { delete a[$2 SUBSEP $3] }
-        $1 == "ABORTED" { delete p[$2 SUBSEP $3] }
+        $1 == "PENDING" && NF == 6 && ($5 == "YES" || $5 == "NO") && $6 == "NONE" { p[$2 SUBSEP $3] = $0 }
+        $1 == "ACTIVE"  && NF == 6 && ($5 == "YES" || $5 == "NO") && $6 == "NONE" { a[$2 SUBSEP $3] = $0; delete p[$2 SUBSEP $3] }
+        $1 == "REVOKED" && NF == 4 { delete a[$2 SUBSEP $3] }
+        $1 == "ABORTED" && NF == 5 { delete p[$2 SUBSEP $3] }
         END {
             if (want == "active") { for (k in a) print a[k] }
             else                  { for (k in p) print p[k] }
@@ -244,22 +242,6 @@ history_records() { # history_records active|pending
 }
 active_grants()      { history_records active; }
 pending_operations() { history_records pending; }
-
-# Lines found in other *.history files beside this script that are not in the
-# current history. They are never read automatically.
-LEGACY_FILES=(); LEGACY_LINES=()
-collect_legacy() {
-    LEGACY_FILES=(); LEGACY_LINES=()
-    local f line
-    for f in "$SCRIPT_DIR"/*.history; do
-        [[ -f "$f" && ! -L "$f" && "$f" != "$HISTORY_FILE" ]] || continue
-        while IFS= read -r line; do
-            case "$line" in ACTIVE$'\t'*|REVOKED$'\t'*|PENDING$'\t'*|ABORTED$'\t'*) ;; *) continue ;; esac
-            if [[ -f "$HISTORY_FILE" ]] && grep -Fxq -- "$line" "$HISTORY_FILE"; then continue; fi
-            LEGACY_FILES+=("$f"); LEGACY_LINES+=("$line")
-        done <"$f"
-    done
-}
 
 # ------------------------------------------------------ rollback / traps ----
 # Undoes a grant started by this run. Returns 0 when MariaDB is back to the
@@ -442,22 +424,26 @@ view_grants() {
 view_remote() {
     title 'Remote access overview'
     local -a remote_accounts=() records=() pending=()
-    local account rec rec_kind rec_db rec_user rec_at rec_created rec_pre
-    mapfile -t remote_accounts < <(db_query -e "SELECT User FROM mysql.user WHERE Host = '%' AND User <> '' ORDER BY User;")
-    printf '  %sAccounts that accept connections from any host (live from MariaDB):%s\n' "$BOLD" "$RESET"
+    local account account_host rec rec_kind rec_db rec_user rec_at rec_created
+    mapfile -t remote_accounts < <(db_query -e "SELECT User, Host FROM mysql.user WHERE Host <> 'localhost' AND User <> '' ORDER BY User, Host;")
+    printf '  %sRemote MariaDB accounts (live server state; host patterns included):%s\n' "$BOLD" "$RESET"
     if (( ${#remote_accounts[@]} == 0 )); then
         note '    none'
     else
-        for account in "${remote_accounts[@]}"; do printf "    - %s@%%\n" "$account"; done
+        for account in "${remote_accounts[@]}"; do
+            IFS=$'\t' read -r account account_host <<<"$account"
+            printf '    - %s@%s\n' "$account" "$account_host"
+        done
     fi
 
     mapfile -t records < <(active_grants)
-    printf '\n  %sActive grants created by this tool:%s\n' "$BOLD" "$RESET"
+    printf '\n  %sDatabase grants tracked by this tool:%s\n' "$BOLD" "$RESET"
     if (( ${#records[@]} == 0 )); then
         note '    none'
+        info 'This means there are no per-database grants in this tool’s history; remote accounts above may still exist.'
     else
         for rec in "${records[@]}"; do
-            IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created rec_pre <<<"$rec"
+            IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created _ <<<"$rec"
             printf "    - %s@%% on %s (since %s, account created by tool: %s)\n" "$rec_user" "$rec_db" "$rec_at" "${rec_created:-YES}"
         done
     fi
@@ -466,13 +452,14 @@ view_remote() {
     if (( ${#pending[@]} > 0 )); then
         printf '\n  %sOperations needing attention (interrupted before completion):%s\n' "$BOLD" "$RESET"
         for rec in "${pending[@]}"; do
-            IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created rec_pre <<<"$rec"
+            IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created _ <<<"$rec"
             printf "    - %s@%% on %s (started %s)\n" "$rec_user" "$rec_db" "$rec_at"
         done
         warn "MariaDB may hold a partial grant for these. Use 'revoke' to inspect them."
     fi
     printf '\n'
-    hint 'Remote accounts that are not listed as created by this tool are never modified or removed.'
+    hint 'Option 6 revokes only database grants tracked by this tool.'
+    hint 'Option 9 removes a selected remote account and all its grants after exact-name confirmation.'
     hint 'This tool only manages the MariaDB side. Network listening and firewall rules are separate (see: diagnose).'
 }
 
@@ -714,7 +701,7 @@ grant_flow() {
 # ----------------------------------------------------------- revoke flow ----
 revoke_flow() {
     local step=0 rc idx rec confirmation manual='NO'
-    local rec_kind='' rec_db='' rec_user='' rec_at='' rec_created='YES' rec_pre=''
+    local rec_kind='' rec_db='' rec_user='' rec_at='' rec_created='YES'
     local u_sql broad_rc other remaining account_exists dropped='NO'
     local -a records=()
 
@@ -726,13 +713,24 @@ revoke_flow() {
         0)  printf '\n  %sStep 1/2 - Choose the grant to revoke%s\n' "$BOLD" "$RESET"
             mapfile -t records < <(active_grants; pending_operations)
             if (( ${#records[@]} == 0 )); then
-                info 'No active remote grants created by this tool.'
-                hint 'Remote accounts that are not tracked in the history are never modified or removed.'
+                info 'No database grants are tracked by this tool.'
+                local -a current_remote=()
+                mapfile -t current_remote < <(db_query -e "SELECT User, Host FROM mysql.user WHERE Host <> 'localhost' AND User <> '' ORDER BY User, Host;")
+                if (( ${#current_remote[@]} > 0 )); then
+                    note 'Remote accounts still present in MariaDB:'
+                    for rec in "${current_remote[@]}"; do
+                        IFS=$'\t' read -r rec_user rec_created <<<"$rec"
+                        printf '    - %s@%s\n' "$rec_user" "$rec_created"
+                    done
+                    hint 'Use option 9 to remove a selected remote account and all its grants.'
+                else
+                    note 'No remote accounts are present in MariaDB.'
+                fi
                 return 0
             fi
             PICK_LABELS=(); PICK_KEYS=()
             for rec in "${records[@]}"; do
-                IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created rec_pre <<<"$rec"
+                IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created _ <<<"$rec"
                 rec_at="${rec_at:-?}"
                 if [[ "$rec_kind" == 'PENDING' ]]; then
                     PICK_LABELS+=("$(printf "%-30s on %-28s since %s [interrupted]" "${rec_user}@%" "$rec_db" "$rec_at")")
@@ -745,24 +743,16 @@ revoke_flow() {
             pick_index 'Grant (number or user@%):' && rc=0 || rc=$?
             if (( rc == 10 )); then return 0; fi
             idx=$PICK_INDEX
-            rec_created='YES'; rec_pre=''
-            IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created rec_pre <<<"${records[idx]}"
-            rec_created="${rec_created:-YES}"
+            IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_created _ <<<"${records[idx]}"
             manual='NO'
-            if [[ "$rec_kind" == 'PENDING' || ( "$rec_created" == 'NO' && "$rec_pre" != 'NONE' ) ]]; then
+            if [[ "$rec_kind" == 'PENDING' ]]; then
                 manual='YES'
             fi
             step=1
             ;;
         1)  printf '\n  %sStep 2/2 - Confirm%s\n\n' "$BOLD" "$RESET"
             if [[ "$manual" == 'YES' ]]; then
-                if [[ "$rec_kind" == 'PENDING' ]]; then
-                    warn 'This operation was interrupted. MariaDB may hold a partial or complete grant.'
-                else
-                    warn 'This record comes from an older version that did not check the account'
-                    warn 'for pre-existing privileges. Automatic revocation is disabled so that'
-                    warn 'privileges this tool did not add are never removed.'
-                fi
+                warn 'This operation was interrupted. MariaDB may hold a partial or complete grant.'
                 printf '\n  %sCurrent grants of %s@%%:%s\n' "$BOLD" "$rec_user" "$RESET"
                 db_query -e "SHOW GRANTS FOR '$(sql_value "$rec_user")'@'%';" 2>/dev/null \
                     | sed -E "s/(IDENTIFIED BY PASSWORD )'[^']*'/\1'<hidden>'/; s/^/    /" \
@@ -776,11 +766,7 @@ revoke_flow() {
                     warn "Nothing changed. Type FORGET exactly, or 'back'."
                     continue
                 fi
-                if [[ "$rec_kind" == 'PENDING' ]]; then
-                    history_append ABORTED "$rec_db" "$rec_user" "$(date -Is)" 'closed manually' || { err 'Could not write the history file.'; return 1; }
-                else
-                    history_append REVOKED "$rec_db" "$rec_user" "$(date -Is)" || { err 'Could not write the history file.'; return 1; }
-                fi
+                history_append ABORTED "$rec_db" "$rec_user" "$(date -Is)" 'closed manually' || { err 'Could not write the history file.'; return 1; }
                 ok 'Record removed from the history. MariaDB was not changed.'
                 warn "${rec_user}@'%' keeps whatever privileges it has until you revoke them yourself."
                 return 0
@@ -862,41 +848,76 @@ revoke_flow() {
     done
 }
 
-# --------------------------------------------------------- legacy history ---
-migrate_flow() {
-    local i rc confirmation kind db user at created pre
-    local -a fields=()
-    title 'Import a legacy history file'
+# Remove any remote MariaDB identity, including accounts that were not created
+# or tracked by this tool. This drops the selected user@host and every grant.
+remove_remote_account_flow() {
+    local i rc username host account_label confirmation account_exists
+    local -a remote_users=() remote_hosts=() remote_labels=() remote_keys=()
+
+    title 'Remove an existing remote account'
     nav_hint
-    collect_legacy
-    if (( ${#LEGACY_LINES[@]} == 0 )); then
-        info 'No legacy history records to import.'
+    load_users
+    for ((i = 0; i < ${#USER_NAMES[@]}; i++)); do
+        [[ "${USER_HOSTS[i]}" == 'localhost' ]] && continue
+        remote_users+=("${USER_NAMES[i]}")
+        remote_hosts+=("${USER_HOSTS[i]}")
+        remote_labels+=("${USER_NAMES[i]}@${USER_HOSTS[i]}")
+        remote_keys+=("${USER_NAMES[i]}@${USER_HOSTS[i]}")
+    done
+    if (( ${#remote_users[@]} == 0 )); then
+        info 'No remote MariaDB accounts were found. The localhost accounts are not listed here.'
         return 0
     fi
+
+    printf '\n  This removes an account that may have existed before this tool.\n'
+    PICK_LABELS=("${remote_labels[@]}")
+    PICK_KEYS=("${remote_keys[@]}")
     printf '\n'
-    for ((i = 0; i < ${#LEGACY_LINES[@]}; i++)); do
-        IFS=$'\t' read -r kind db user at created pre <<<"${LEGACY_LINES[i]}"
-        printf '    %-8s %s@%% on %s (%s)  [%s]\n' "$kind" "$user" "$db" "$at" "$(basename -- "${LEGACY_FILES[i]}")"
-    done
+    pick_index 'Remote account to remove (number or user@host):' && rc=0 || rc=$?
+    if (( rc == 10 )); then return 0; fi
+    username="${remote_users[PICK_INDEX]}"
+    host="${remote_hosts[PICK_INDEX]}"
+    account_label="${username}@${host}"
+
+    printf '\n  %sCurrent grants for %s:%s\n' "$BOLD" "$account_label" "$RESET"
+    if ! db_query -e "SHOW GRANTS FOR '$(sql_value "$username")'@'$(sql_value "$host")';" \
+        | sed -E "s/(IDENTIFIED BY PASSWORD )'[^']*'/\1'<hidden>'/; s/^/    /"; then
+        err 'Could not read the account grants. Nothing was changed.'
+        return 1
+    fi
+
     printf '\n'
-    note 'Importing only copies these records into the current history file.'
-    note 'Nothing is revoked, dropped or changed in MariaDB.'
-    note 'Reused-account entries from older versions stay "legacy": they are never revoked automatically.'
-    printf '\n'
-    while true; do
-        ask confirmation "Type IMPORT to copy ${#LEGACY_LINES[@]} record(s) (or 'back'):" && rc=0 || rc=$?
-        if (( rc == 10 )); then return 0; fi
-        [[ "$confirmation" == 'IMPORT' ]] && break
-        warn "Nothing imported. Type IMPORT exactly, or 'back'."
-    done
-    for ((i = 0; i < ${#LEGACY_LINES[@]}; i++)); do
-        IFS=$'\t' read -r -a fields <<<"${LEGACY_LINES[i]}"
-        if ! history_append "${fields[@]}"; then
-            err "Could not write ${HISTORY_FILE}. Import stopped after ${i} record(s)."
-            return 1
-        fi
-    done
-    ok "Imported ${#LEGACY_LINES[@]} record(s) into ${HISTORY_FILE}."
+    warn "This permanently drops ${account_label} and ALL grants attached to that account."
+    note "The separate ${username}@localhost account is not touched."
+    warn 'Applications using this remote account will stop connecting.'
+    hint "To continue, type exactly: DROP ${account_label}"
+    ask confirmation 'Confirmation:' && rc=0 || rc=$?
+    if (( rc == 10 )); then return 0; fi
+    if [[ "$confirmation" != "DROP ${account_label}" ]]; then
+        warn 'The confirmation did not match. Nothing was changed.'
+        return 0
+    fi
+
+    if ! history_append REMOTE_DROP_PENDING "$username" "$host" "$(date -Is)"; then
+        err "Cannot write the history file (${HISTORY_FILE}). Nothing was changed in MariaDB."
+        return 1
+    fi
+    if ! db_query -e "DROP USER '$(sql_value "$username")'@'$(sql_value "$host")';"; then
+        history_append REMOTE_DROP_ABORTED "$username" "$host" "$(date -Is)" || true
+        err "MariaDB could not remove ${account_label}."
+        return 1
+    fi
+    account_exists="$(remote_account_count "$username" "$host")" || account_exists='?'
+    if [[ "$account_exists" != '0' ]]; then
+        err "MariaDB still reports ${account_label}. Check its status manually; history records the attempted removal."
+        return 1
+    fi
+    if ! history_append REMOTE_DROPPED "$username" "$host" "$(date -Is)"; then
+        err "${account_label} was removed, but the result could not be written to ${HISTORY_FILE}."
+        return 1
+    fi
+    ok "Removed ${account_label} and all its MariaDB grants."
+    info "History: ${HISTORY_FILE}"
 }
 
 startup_notices() {
@@ -908,11 +929,6 @@ startup_notices() {
         IFS=$'\t' read -r rec_kind rec_db rec_user rec_at rec_rest <<<"$rec"
         warn "Interrupted operation found: ${rec_user}@'%' on ${rec_db} (started ${rec_at}). Use 'Revoke remote access' to inspect it."
     done
-    collect_legacy
-    if (( ${#LEGACY_LINES[@]} > 0 )); then
-        warn "Legacy history found ($(basename -- "${LEGACY_FILES[0]}")) with ${#LEGACY_LINES[@]} record(s) not in the current history."
-        warn "It is NOT read automatically. Use 'Import legacy history' to review it. Nothing is ever revoked because a history is missing."
-    fi
 }
 
 # ------------------------------------------------------------------ menu ----
@@ -929,7 +945,7 @@ main_menu() {
         printf '    %s6)%s Revoke remote access\n' "$CYAN" "$RESET"
         printf '    %s7)%s Server information\n' "$CYAN" "$RESET"
         printf '    %s8)%s Network diagnosis (can remote clients connect?)\n' "$CYAN" "$RESET"
-        printf '    %s9)%s Import legacy history\n' "$CYAN" "$RESET"
+        printf '    %s9)%s Remove an existing remote account (drop account + all grants)\n' "$CYAN" "$RESET"
         printf '    %sq)%s Quit\n\n' "$CYAN" "$RESET"
         ask choice 'Choice:' && rc=0 || rc=$?
         if (( rc == 10 )); then hint "You are already at the main menu. Type 'quit' to exit."; continue; fi
@@ -942,7 +958,7 @@ main_menu() {
             6) revoke_flow || true ;;
             7) view_server ;;
             8) diagnose_flow ;;
-            9) migrate_flow || true ;;
+            9) remove_remote_account_flow || true ;;
             *) err "Invalid choice: ${choice}" ;;
         esac
     done
@@ -957,5 +973,5 @@ case "$COMMAND" in
     diagnose)  diagnose_flow ;;
     grant)     grant_flow ;;
     revoke)    revoke_flow ;;
-    migrate)   migrate_flow ;;
+    remove-remote) remove_remote_account_flow ;;
 esac

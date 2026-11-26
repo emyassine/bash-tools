@@ -146,45 +146,19 @@ assert 'same-schema table grant added later is preserved' grep -Fxq $'app\t%\tsh
 assert 'exact tool grant is removed beside table grant' bash -c '! grep -Fxq "app\t%\tshopdb" "$FAKE_DB_DIR/dbgrants"'
 assert 'table-grant case closes the managed history'   last_hist REVOKED
 new_env; run_cli "$NEWPW" grant; run_cli '1\nREVOKE\n' revoke; run_cli '1\n' revoke
-assert 'nothing left to revoke afterwards'           out_has 'No active remote grants'
+assert 'nothing left to revoke afterwards'           out_has 'No database grants are tracked by this tool'
 
-section '9. Legacy record (older version, reused account) is never auto-revoked'
-new_env; printf 'app\t%%\n' >>"$FAKE_DB_DIR/users"; printf 'app\t%%\tshopdb\n' >"$FAKE_DB_DIR/dbgrants"
-printf 'ACTIVE\tshopdb\tapp\t2026-11-26T10:24:45+01:00\tNO\n' >"$HIST"
-run_cli '1\nREVOKE\nback\nquit\n' revoke
-assert 'older-version warning is shown'              out_has 'older version'
-assert 'REVOKE is refused'                           out_has 'Type FORGET'
-assert 'privileges untouched by REVOKE input'        has_row app '%' shopdb
-assert 'no REVOKE statement executed'                log_lacks '^REVOKE'
-run_cli '1\nFORGET\n' revoke
-assert 'FORGET only edits the history'               last_hist REVOKED
-assert 'FORGET leaves MariaDB untouched'             has_row app '%' shopdb
-assert 'FORGET executes no SQL write'                log_lacks '^(REVOKE|DROP|GRANT|CREATE)'
-
-section '10. Missing history never revokes or removes anything'
+section '9. Missing history never revokes or removes anything'
 new_env; printf 'app\t%%\n' >>"$FAKE_DB_DIR/users"; printf 'app\t%%\tshopdb\n' >"$FAKE_DB_DIR/dbgrants"
 run_cli '' revoke
-assert 'revoke finds nothing to do'                  out_has 'No active remote grants'
+assert 'revoke finds nothing to do'                  out_has 'No database grants are tracked by this tool'
 assert 'account still exists'                        has_user app '%'
 assert 'privileges still exist'                      has_row app '%' shopdb
 run_cli '' remote
 assert 'remote view lists the untracked account'     out_has 'app@%'
-assert 'remote view says untracked ones are never modified' out_has 'never modified or removed'
+assert 'remote view explains unmanaged-account removal' out_has 'Option 9 removes a selected remote account'
 
-section '11. Legacy history file detection and import'
-new_env; printf 'ACTIVE\tshopdb\tapp\t2026-11-01T09:00:00+01:00\tYES\n' >"$T/remote-db-access.sh.history"
-run_cli 'q\n' menu
-assert 'warns that a legacy history exists'          out_has 'Legacy history found'
-assert 'states it is not read automatically'         out_has 'NOT read automatically'
-run_cli 'back\n' migrate
-assert 'back cancels the import'                     test ! -e "$HIST"
-run_cli 'IMPORT\n' migrate
-assert 'import copies the record'                    hist_has $'^ACTIVE\tshopdb\tapp\t'
-assert 'import changes nothing in MariaDB'           log_lacks '^(REVOKE|DROP|GRANT|CREATE)'
-run_cli 'q\n' menu
-assert 'no legacy warning after import'              out_lacks 'Legacy history found'
-
-section '12. Network diagnosis (read-only)'
+section '10. Network diagnosis (read-only)'
 new_env; export FAKE_SS_ADDR='127.0.0.1:3306'; run_cli '' diagnose
 assert 'loopback-only listening is flagged'          out_has 'only on the loopback interface'
 assert 'tells how, without doing it'                 out_has 'restart the service'
@@ -194,7 +168,7 @@ assert 'public listening is reported'                out_has 'non-loopback addre
 unset FAKE_SS_ADDR; run_cli '' diagnose
 assert 'falls back to the bind_address variable'     out_has 'only on the loopback interface'
 
-section '13. Interrupted operation notice'
+section '11. Interrupted operation notice'
 new_env; printf 'PENDING\tshopdb\tapp\t2026-11-26T10:00:00+01:00\tYES\tNONE\n' >"$HIST"
 run_cli 'q\n' menu
 assert 'interrupted operation is reported at start'  out_has 'Interrupted operation found'
@@ -203,7 +177,7 @@ assert 'remote view lists it'                        out_has 'needing attention'
 run_cli '1\nFORGET\n' revoke
 assert 'FORGET closes it with ABORTED'               last_hist ABORTED
 
-section '14. Navigation and existing commands'
+section '12. Navigation and existing commands'
 new_env; run_cli 'shopdb\nback\nquit\n' grant
 step1_twice() { [[ "$(grep -c 'Step 1/4' <<<"$OUT")" -ge 2 ]]; }
 assert 'back from step 2 returns to step 1'          step1_twice
@@ -214,6 +188,18 @@ run_cli '' users;              assert 'users command'      out_has 'app@localhos
 run_cli '' info;               assert 'info command'       out_has 'bind_address'
 run_cli '' remote;             assert 'remote command'     out_has 'Remote access overview'
 run_cli '1\nq\n' menu;         assert 'menu lists databases' out_has 'blogdb'
+
+section '13. Explicit removal of any existing remote account'
+new_env; printf 'app\t%%\nblog\t%%\n' >>"$FAKE_DB_DIR/users"
+run_cli 'app@%\nDROP app@%\n' remove-remote
+assert 'selected unmanaged remote account is dropped' bash -c '! grep -Fxq "app\t%" "$FAKE_DB_DIR/users"'
+assert 'same-name localhost account remains'         has_user app localhost
+assert 'other remote account remains'                has_user blog '%'
+assert 'account removal is recorded in history'      hist_has $'^REMOTE_DROPPED\tapp\t%\t'
+assert 'all grants for removed account are gone'     log_has "^DROP USER 'app'@'%';$"
+new_env; printf 'app\t%%\n' >>"$FAKE_DB_DIR/users"; run_cli 'app@%\nDROP\n' remove-remote
+assert 'incorrect confirmation preserves account'   has_user app '%'
+assert 'incorrect confirmation executes no drop'    log_lacks '^DROP USER'
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
