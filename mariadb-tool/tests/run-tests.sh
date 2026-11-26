@@ -135,6 +135,16 @@ new_env; run_cli "$NEWPW" grant; printf 'app\t%%\tblogdb\n' >>"$FAKE_DB_DIR/dbgr
 assert 'account with newer privileges is NOT dropped' has_user app '%'
 assert 'newer privileges are preserved'              has_row app '%' blogdb
 assert 'tool-added privileges are removed'           bash -c '! grep -Fxq "app	%	shopdb" "$FAKE_DB_DIR/dbgrants"'
+new_env; run_cli "$NEWPW" grant; printf 'app\t%%\tshop%%\n' >>"$FAKE_DB_DIR/dbgrants"; run_cli '1\nREVOKE\n' revoke
+assert 'wildcard privilege added later keeps the account' has_user app '%'
+assert 'wildcard privilege added later is preserved'  has_row app '%' 'shop%'
+assert 'exact tool grant is removed beside wildcard'   bash -c '! grep -Fxq "app\t%\tshopdb" "$FAKE_DB_DIR/dbgrants"'
+assert 'wildcard case closes the managed history'     last_hist REVOKED
+new_env; run_cli "$NEWPW" grant; printf 'app\t%%\tshopdb\ttable1\n' >>"$FAKE_DB_DIR/tableprivs"; run_cli '1\nREVOKE\n' revoke
+assert 'same-schema table grant added later keeps account' has_user app '%'
+assert 'same-schema table grant added later is preserved' grep -Fxq $'app\t%\tshopdb\ttable1' "$FAKE_DB_DIR/tableprivs"
+assert 'exact tool grant is removed beside table grant' bash -c '! grep -Fxq "app\t%\tshopdb" "$FAKE_DB_DIR/dbgrants"'
+assert 'table-grant case closes the managed history'   last_hist REVOKED
 new_env; run_cli "$NEWPW" grant; run_cli '1\nREVOKE\n' revoke; run_cli '1\n' revoke
 assert 'nothing left to revoke afterwards'           out_has 'No active remote grants'
 

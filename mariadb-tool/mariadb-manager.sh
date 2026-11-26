@@ -5,10 +5,10 @@
 # touches accounts and grants that this tool created.
 set -Eeuo pipefail
 
-VERSION='2.1.0'
+VERSION='2.1.1'
 EDITION='2026'
 RELEASED='November 26, 2026'
-RELEASE_NOTES='Safe reuse of existing remote accounts, write-ahead history with rollback, wildcard-safe grants, network diagnosis, legacy history import.'
+RELEASE_NOTES='Safer exact-grant revocation; preserve later wildcard and object-level privileges; verify managed grant removal.'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
@@ -158,11 +158,25 @@ count_db_privileges() { # count_db_privileges USER DATABASE
     db_query -e "SELECT (SELECT COUNT(*) FROM mysql.db WHERE User = '${u}' AND Host = '%' AND '${d}' LIKE Db) + (SELECT COUNT(*) FROM mysql.tables_priv WHERE User = '${u}' AND Host = '%' AND Db = '${d}') + (SELECT COUNT(*) FROM mysql.columns_priv WHERE User = '${u}' AND Host = '%' AND Db = '${d}') + (SELECT COUNT(*) FROM mysql.procs_priv WHERE User = '${u}' AND Host = '%' AND Db = '${d}');"
 }
 
-# Number of privilege rows of USER@'%' that do NOT touch DATABASE.
+# Number of privilege rows that do not belong to this tool's exact database
+# grant. Database wildcard rows and object-level grants are additional access,
+# even when they happen to cover DATABASE.
 count_other_privileges() { # count_other_privileges USER DATABASE
     local u d
-    u="$(sql_value "$1")"; d="$(sql_value "$2")"
-    db_query -e "SELECT (SELECT COUNT(*) FROM mysql.db WHERE User = '${u}' AND Host = '%' AND NOT ('${d}' LIKE Db)) + (SELECT COUNT(*) FROM mysql.tables_priv WHERE User = '${u}' AND Host = '%' AND Db <> '${d}') + (SELECT COUNT(*) FROM mysql.columns_priv WHERE User = '${u}' AND Host = '%' AND Db <> '${d}') + (SELECT COUNT(*) FROM mysql.procs_priv WHERE User = '${u}' AND Host = '%' AND Db <> '${d}');"
+    u="$(sql_value "$1")"
+    d="$(sql_value "$(like_escape "$2")")"
+    db_query -e "SELECT (SELECT COUNT(*) FROM mysql.db WHERE User = '${u}' AND Host = '%' AND NOT (Db = '${d}')) + (SELECT COUNT(*) FROM mysql.tables_priv WHERE User = '${u}' AND Host = '%') + (SELECT COUNT(*) FROM mysql.columns_priv WHERE User = '${u}' AND Host = '%') + (SELECT COUNT(*) FROM mysql.procs_priv WHERE User = '${u}' AND Host = '%');"
+}
+
+# Count only the database-level rows this tool knows how to remove. Other
+# grants may still cover the same database and must not keep this history entry
+# active after the exact grant has been removed.
+count_exact_db_rows() { # count_exact_db_rows USER DATABASE
+    local u d_raw d_esc
+    u="$(sql_value "$1")"
+    d_raw="$(sql_value "$2")"
+    d_esc="$(sql_value "$(like_escape "$2")")"
+    db_query -e "SELECT COUNT(*) FROM mysql.db WHERE User = '${u}' AND Host = '%' AND Db IN ('${d_esc}', '${d_raw}');"
 }
 
 # Returns 0 when USER@'%' has global privileges or roles, 1 when it has not,
@@ -814,15 +828,15 @@ revoke_flow() {
                         err 'MariaDB could not revoke the database privileges.'; step=1; continue
                     fi
                 fi
-                # Verify the result before touching the history.
+                # Verify that the exact database-level grant(s) managed by this
+                # tool are gone. Other grants may still cover the same schema.
                 if [[ "$dropped" == 'YES' ]]; then
                     remaining="$(remote_account_count "$rec_user")" || remaining='?'
                 else
-                    remaining="$(count_db_privileges "$rec_user" "$rec_db")" || remaining='?'
+                    remaining="$(count_exact_db_rows "$rec_user" "$rec_db")" || remaining='?'
                 fi
                 if [[ "$remaining" != '0' ]]; then
-                    err "MariaDB still shows access for ${rec_user}@'%' on ${rec_db}. The history was NOT updated."
-                    note 'It may be covered by a wildcard or table-level grant that this tool did not create.'
+                    err "MariaDB still shows the exact database grant for ${rec_user}@'%' on ${rec_db}. The history was NOT updated."
                     step=1; continue
                 fi
             else
@@ -838,6 +852,9 @@ revoke_flow() {
                 ok "Dropped ${rec_user}@'%'. The localhost account remains unchanged."
             else
                 ok "Revoked ${rec_user}@'%' on ${rec_db}. The localhost account remains unchanged."
+                if [[ "$rec_created" == 'YES' ]]; then
+                    info "The remote account was kept because it has privileges beyond the grant managed here."
+                fi
             fi
             return 0
             ;;

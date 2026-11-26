@@ -40,11 +40,19 @@ priv_count() { # priv_count USER DB match|other
     local u="$1" d="$2" mode="$3" n=0 user host pat db tbl
     while IFS=$'\t' read -r user host pat; do
         [[ "$user" == "$u" && "$host" == '%' ]] || continue
-        if like_match "$d" "$pat"; then [[ "$mode" == match ]] && n=$((n + 1)); else [[ "$mode" == other ]] && n=$((n + 1)); fi
+        if [[ "$mode" == other ]]; then
+            [[ "$pat" != "$d" ]] && n=$((n + 1))
+        elif like_match "$d" "$pat"; then
+            n=$((n + 1))
+        fi
     done <"$D/dbgrants"
     while IFS=$'\t' read -r user host db tbl; do
         [[ "$user" == "$u" && "$host" == '%' ]] || continue
-        if [[ "$db" == "$d" ]]; then [[ "$mode" == match ]] && n=$((n + 1)); else [[ "$mode" == other ]] && n=$((n + 1)); fi
+        if [[ "$mode" == other ]]; then
+            n=$((n + 1))
+        elif [[ "$db" == "$d" ]]; then
+            n=$((n + 1))
+        fi
     done <"$D/tableprivs"
     echo "$n"
 }
@@ -68,9 +76,22 @@ if [[ "$nsql" =~ $re ]]; then
 fi
 if has 'SELECT (SELECT COUNT(*) FROM mysql.db'; then
     [[ "$nsql" =~ User\ =\ \"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
-    [[ "$nsql" =~ \"([^\"]*)\"\ LIKE\ Db ]] && d="$(unq "${BASH_REMATCH[1]}")"
-    if has 'NOT ('; then priv_count "$u" "$d" other; else priv_count "$u" "$d" match; fi
+    if has 'NOT (Db = '; then
+        [[ "$nsql" =~ Db\ =\ \"([^\"]*)\" ]] && d="$(unq "${BASH_REMATCH[1]}")"
+        priv_count "$u" "$d" other
+    else
+        [[ "$nsql" =~ \"([^\"]*)\"\ LIKE\ Db ]] && d="$(unq "${BASH_REMATCH[1]}")"
+        priv_count "$u" "$d" match
+    fi
     exit 0
+fi
+re='SELECT COUNT\(\*\) FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db IN \("([^"]*)", "([^"]*)"\)'
+if [[ "$nsql" =~ $re ]]; then
+    u="${BASH_REMATCH[1]}"; a="$(unq "${BASH_REMATCH[2]}")"; b="$(unq "${BASH_REMATCH[3]}")"; n=0
+    while IFS=$'\t' read -r user host pat; do
+        [[ "$user" == "$u" && "$host" == '%' && ( "$pat" == "$a" || "$pat" == "$b" ) ]] && n=$((n + 1))
+    done <"$D/dbgrants"
+    echo "$n"; exit 0
 fi
 re='SELECT Db FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db IN \("([^"]*)", "([^"]*)"\)'
 if [[ "$nsql" =~ $re ]]; then
