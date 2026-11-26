@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# yas-gacp - git add + commit + push, with readable colored output.
+# Usage: yas-gacp "commit message"
+# Disable colors: NO_COLOR=1 yas-gacp "message"
+
+set -u
+
+VERSION='1.3.0'
+EDITION='2026'
+RELEASED='November 25, 2026 at 00:00 UTC'
+RELEASE_NOTES='Retries transient HTTP 408 push timeouts up to three times with a short delay, then gives a targeted retry hint.'
+
+# ----------------------------- Colors -----------------------------
+use_color() { [[ -t "$1" && -z "${NO_COLOR:-}" ]]; }
+
+if use_color 1; then
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'; MAGENTA=$'\033[35m'; CYAN=$'\033[36m'
+else
+    RESET=''; BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''
+fi
+
+if use_color 2; then
+    E_RESET=$'\033[0m'; E_BOLD=$'\033[1m'; E_RED=$'\033[31m'
+    E_YELLOW=$'\033[33m'; E_CYAN=$'\033[36m'
+else
+    E_RESET=''; E_BOLD=''; E_RED=''; E_YELLOW=''; E_CYAN=''
+fi
+
+# -------------------------- Output helpers --------------------------
+TOTAL_STEPS=4
+
+step()  { printf '\n%s%s[%s/%s]%s %s%s%s\n' "$BOLD" "$BLUE" "$1" "$TOTAL_STEPS" "$RESET" "$BOLD" "$2" "$RESET"; }
+ok()    { printf '  %s[OK]%s %s\n' "$GREEN$BOLD" "$RESET" "$*"; }
+info()  { printf '  %s[i]%s  %s\n' "$CYAN$BOLD" "$RESET" "$*"; }
+warn()  { printf '  %s[!]%s  %s\n' "$YELLOW$BOLD" "$RESET" "$*"; }
+dim()   { printf '      %s%s%s\n' "$DIM" "$*" "$RESET"; }
+
+err()   { printf '  %s[ERROR]%s %s\n' "$E_BOLD$E_RED" "$E_RESET" "$*" >&2; }
+diag()  { printf '  %s->  Diagnosis:%s %s\n' "$E_BOLD$E_YELLOW" "$E_RESET" "$*" >&2; }
+hint()  { printf '  %s->  Run:%s %s%s%s\n' "$E_BOLD$E_CYAN" "$E_RESET" "$E_BOLD" "$*" "$E_RESET" >&2; }
+
+usage() {
+    cat <<EOF
+Usage:
+  yas-gacp "commit message"  Stage, commit, and push the current branch
+  yas-gacp --version          Print the installed version
+  yas-gacp --update           Update yas-gacp from its GitHub main branch
+  yas-gacp --help             Show this help
+EOF
+}
+
+update_self() (
+    local script_path target tmp old_version old_edition old_released new_version new_edition new_released release_notes
+    script_path=$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")
+    if [[ "$script_path" != /* ]]; then
+        script_path="$PWD/$script_path"
+    fi
+    target=$(readlink -f -- "$script_path" 2>/dev/null || printf '%s' "$script_path")
+    old_version=$(sed -n "s/^VERSION='\([^']*\)'$/\1/p" "$target" 2>/dev/null || true)
+    old_edition=$(sed -n "s/^EDITION='\([^']*\)'$/\1/p" "$target" 2>/dev/null || true)
+    old_released=$(sed -n "s/^RELEASED='\([^']*\)'$/\1/p" "$target" 2>/dev/null || true)
+    tmp=$(mktemp "${TMPDIR:-/tmp}/yas-gacp-update.XXXXXX") || {
+        err 'could not create a temporary update file.'
+        return 1
+    }
+    trap 'rm -f "$tmp" "${target}.new"' EXIT
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL 'https://raw.githubusercontent.com/emyassine/gacp/main/yas-gacp' -o "$tmp" || {
+            err 'update download failed; check your connection and retry.'
+            return 1
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q 'https://raw.githubusercontent.com/emyassine/gacp/main/yas-gacp' -O "$tmp" || {
+            err 'update download failed; check your connection and retry.'
+            return 1
+        }
+    else
+        err 'curl or wget is required to update yas-gacp.'
+        return 1
+    fi
+
+    if [[ ! -s "$tmp" ]] || ! grep -q '^VERSION=' "$tmp" || ! bash -n "$tmp"; then
+        err 'downloaded update is empty or invalid; existing installation was kept.'
+        return 1
+    fi
+    new_version=$(sed -n "s/^VERSION='\([^']*\)'$/\1/p" "$tmp")
+    new_edition=$(sed -n "s/^EDITION='\([^']*\)'$/\1/p" "$tmp")
+    new_released=$(sed -n "s/^RELEASED='\([^']*\)'$/\1/p" "$tmp")
+    release_notes=$(sed -n "s/^RELEASE_NOTES='\(.*\)'$/\1/p" "$tmp")
+    if [[ -z "$new_version" || -z "$new_edition" || -z "$new_released" || -z "$release_notes" ]]; then
+        err 'downloaded update is missing version or release details; existing installation was kept.'
+        return 1
+    fi
+    if cmp -s "$tmp" "$target"; then
+        ok "Already up to date: yas-gacp ${new_version} (edition ${new_edition}, released ${new_released})."
+        info "Checked the GitHub release; no files changed at ${target}."
+        return 0
+    fi
+    if ! install -m 0755 "$tmp" "${target}.new" || ! mv -f -- "${target}.new" "$target"; then
+        err "could not replace $target."
+        return 1
+    fi
+    [[ -n "$old_version" ]] || old_version='unknown version'
+    [[ -n "$old_edition" ]] || old_edition='edition unknown'
+    [[ -n "$old_released" ]] || old_released='release date unavailable'
+    ok "Updated yas-gacp: ${old_version} (${old_edition}, ${old_released}) -> ${new_version} (edition ${new_edition}, released ${new_released})."
+    info "Downloaded, syntax-checked, and installed the latest script at ${target}."
+    info "Release notes: ${release_notes}"
+)
+
+show_merge_hint() {
+    local target_branch='main'
+    if ! git show-ref --verify --quiet "refs/heads/${target_branch}"; then
+        if git show-ref --verify --quiet refs/heads/master; then
+            target_branch='master'
+        else
+            return 0
+        fi
+    fi
+    [[ "$branch" == "$target_branch" ]] && return 0
+
+    printf '\n%s%s[BRANCH]%s You are on %s, not %s.\n' "$BOLD" "$YELLOW" "$RESET" "$branch" "$target_branch"
+    printf '  To merge this branch into %s later:\n' "$target_branch"
+    printf '    git switch %s && git pull --ff-only && git merge --no-ff %s && git push origin %s\n' "$target_branch" "$branch" "$target_branch"
+    printf '  Or ask Codex: "merge %s into %s".\n' "$branch" "$target_branch"
+}
+
+# Print staged files with a colored status letter (A/M/D/R...)
+print_staged_files() {
+    local max=20 count=0 total status path rest
+    total=$(git diff --cached --name-status | wc -l | tr -d ' ')
+    while IFS=$'\t' read -r status path rest; do
+        [[ -z "$status" ]] && continue
+        local color="$YELLOW" label="$status"
+        case "${status:0:1}" in
+            A) color="$GREEN";   label="A" ;;
+            M) color="$YELLOW";  label="M" ;;
+            D) color="$RED";     label="D" ;;
+            R) color="$CYAN";    label="R"; path="${path} -> ${rest:-}" ;;
+            C) color="$CYAN";    label="C"; path="${path} -> ${rest:-}" ;;
+        esac
+        printf '      %s%s%s  %s\n' "$color$BOLD" "$label" "$RESET" "$path"
+        count=$((count + 1))
+        if (( count >= max )); then
+            local remaining=$((total - max))
+            (( remaining > 0 )) && printf '      %s... and %s more file(s)%s\n' "$DIM" "$remaining" "$RESET"
+            break
+        fi
+    done < <(git diff --cached --name-status)
+}
+
+# Run a command in the background with a spinner; output goes to a log file.
+run_with_spinner() {
+    local label=$1 log=$2
+    shift 2
+    "$@" >"$log" 2>&1 &
+    local pid=$! i=0
+    local frames=('|' '/' '-' '\')
+    if [[ -t 1 ]]; then
+        printf '\033[?25l'
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r  %s%s%s %s' "$CYAN" "${frames[i % 4]}" "$RESET" "$label"
+            i=$((i + 1))
+            sleep 0.1
+        done
+        printf '\r\033[K\033[?25h'
+    fi
+    wait "$pid"
+}
+
+cleanup() {
+    [[ -t 1 ]] && printf '\033[?25h'
+    [[ -n "${push_log:-}" ]] && rm -f "$push_log"
+}
+trap cleanup EXIT
+trap 'printf "\n"; warn "Interrupted."; exit 130' INT TERM
+
+if [[ $# -eq 1 ]]; then
+    case "$1" in
+        --version|-v)
+            printf 'yas-gacp %s (edition %s, released %s)\n' "$VERSION" "$EDITION" "$RELEASED"
+            exit 0
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --update)
+            update_self
+            exit $?
+            ;;
+    esac
+fi
+if [[ $# -gt 1 && "$1" == --* ]]; then
+    err "options must be used on their own."
+    usage >&2
+    exit 2
+fi
+
+# ----------------------------- Validation -----------------------------
+if [[ $# -eq 0 ]]; then
+    usage >&2
+    exit 2
+fi
+
+commit_message="$*"
+if [[ -z "${commit_message//[[:space:]]/}" ]]; then
+    err "Commit message cannot be empty. Nothing was staged or committed."
+    exit 2
+fi
+
+if ! repo_root=$(git rev-parse --show-toplevel 2>/dev/null); then
+    err "this is not inside a Git repository."
+    exit 2
+fi
+
+branch=$(git branch --show-current)
+if [[ -z "$branch" ]]; then
+    err "HEAD is detached; switch to a branch before using yas-gacp."
+    exit 2
+fi
+
+upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+
+# ------------------------------- Header -------------------------------
+printf '\n%s%s+-- yas-gacp : add / commit / push --+%s\n' "$BOLD" "$MAGENTA" "$RESET"
+printf '  %sRepo   %s %s\n' "$DIM" "$RESET" "$(basename "$repo_root")"
+printf '  %sBranch %s %s%s%s\n' "$DIM" "$RESET" "$BOLD$GREEN" "$branch" "$RESET"
+if [[ -n "$upstream" ]]; then
+    printf '  %sRemote %s %s\n' "$DIM" "$RESET" "$upstream"
+else
+    printf '  %sRemote %s %s(no upstream yet)%s\n' "$DIM" "$RESET" "$YELLOW" "$RESET"
+fi
+printf '  %sMessage%s %s"%s"%s\n' "$DIM" "$RESET" "$BOLD" "$commit_message" "$RESET"
+
+# ------------------------------ 1. Add ------------------------------
+step 1 "Staging changes (git add -A)"
+if ! git add -A; then
+    err "git add failed. No commit or push was attempted."
+    exit 1
+fi
+
+committed=0
+if ! git diff --cached --quiet; then
+    print_staged_files
+    shortstat=$(git diff --cached --shortstat | sed 's/^ *//')
+    [[ -n "$shortstat" ]] && dim "$shortstat"
+    ok "Changes staged."
+
+    # ---------------------------- 2. Commit ----------------------------
+    step 2 "Creating local commit"
+    if ! commit_out=$(git commit -m "$commit_message" 2>&1); then
+        printf '%s\n' "$commit_out" >&2
+        err "commit failed. Review the message above; no push was attempted."
+        exit 1
+    fi
+    committed=1
+    ok "Commit saved: ${BOLD}${YELLOW}$(git rev-parse --short HEAD)${RESET} ${DIM}on ${branch}${RESET}"
+else
+    ok "Nothing to stage."
+    step 2 "Creating local commit"
+    info "No new file changes to commit."
+fi
+
+# ------------------------- 3. Upstream check -------------------------
+step 3 "Checking what needs pushing"
+if [[ -n "$upstream" ]]; then
+    ahead=$(git rev-list --count "${upstream}..HEAD" 2>/dev/null || printf '0')
+    if [[ "$ahead" == "0" ]]; then
+        ok "Already up to date with ${BOLD}${upstream}${RESET}. Nothing to push."
+        show_merge_hint
+        printf '\n%s%s[DONE]%s\n\n' "$BOLD" "$GREEN" "$RESET"
+        exit 0
+    fi
+    info "${BOLD}${ahead}${RESET} local commit(s) to push to ${BOLD}${upstream}${RESET}."
+else
+    info "No upstream configured; will publish ${BOLD}${branch}${RESET} to ${BOLD}origin${RESET}."
+fi
+
+# ------------------------------ 4. Push ------------------------------
+step 4 "Pushing"
+push_log=$(mktemp "${TMPDIR:-/tmp}/gacp-push.XXXXXX") || {
+    err "could not create a temporary log for push diagnostics."
+    exit 1
+}
+
+if [[ -n "$upstream" ]]; then
+    push_cmd=(git push)
+    success_msg="Push succeeded. Local and remote branches are synchronized."
+else
+    push_cmd=(git push --set-upstream origin "$branch")
+    success_msg="Push succeeded; upstream is now set to ${BOLD}origin/${branch}${RESET}."
+fi
+
+push_attempt=1
+max_push_attempts=3
+while :; do
+    if run_with_spinner "Pushing to remote (attempt ${push_attempt}/${max_push_attempts})..." "$push_log" "${push_cmd[@]}"; then
+        # Show Git output (dimmed), then the success message
+        while IFS= read -r line; do dim "$line"; done <"$push_log"
+        ok "$success_msg"
+        show_merge_hint
+        printf '\n%s%s[ALL DONE]%s\n\n' "$BOLD" "$GREEN" "$RESET"
+        exit 0
+    else
+        push_status=$?
+    fi
+
+    if (( push_attempt < max_push_attempts )) && grep -Eiq 'HTTP 408|curl 22.*408|requested URL returned error: 408|unexpected disconnect while reading sideband' "$push_log"; then
+        warn "Push timed out (HTTP 408); retrying in 2 seconds (${push_attempt}/${max_push_attempts})."
+        sleep 2
+        push_attempt=$((push_attempt + 1))
+        continue
+    fi
+    break
+done
+
+# --------------------------- Push failure ---------------------------
+printf '\n' >&2
+while IFS= read -r line; do
+    printf '      %s%s%s\n' "$E_RED" "$line" "$E_RESET" >&2
+done <"$push_log"
+
+printf '\n' >&2
+err "PUSH FAILED (exit code ${push_status})."
+if (( committed )); then
+    printf '  %s[OK] Your local commit is still saved; it was not lost.%s\n' "$E_CYAN" "$E_RESET" >&2
+fi
+
+if grep -Eiq 'HTTP 408|curl 22.*408|requested URL returned error: 408' "$push_log"; then
+    diag "the remote request timed out (HTTP 408). Your commit is local; retry when the connection is stable."
+    hint "git push"
+elif grep -Eiq 'fatal error in commit_refs|commit_refs_rules|HTTP 5[0-9][0-9]|internal server error' "$push_log"; then
+    diag "GitHub returned a server-side error. Wait a little, then retry."
+    printf '  %s    The commit is already local; do not recreate it.%s\n' "$E_CYAN" "$E_RESET" >&2
+    hint "git push"
+elif grep -Eiq 'could not resolve host|failed to connect|connection timed out|network is unreachable|temporary failure in name resolution' "$push_log"; then
+    diag "network or DNS problem. Restore connectivity, then retry."
+    hint "git push"
+elif grep -Eiq 'protected branch|repository rule|GH013|ruleset|secret scanning|push declined' "$push_log"; then
+    diag "GitHub blocked the push because of a repository rule. Read the rejection details above and fix that specific violation."
+    hint "git push"
+elif grep -Eiq 'non-fast-forward|fetch first|rejected.*behind' "$push_log"; then
+    diag "the remote has commits you do not have."
+    hint "git pull --rebase   # resolve conflicts if any, then: git push"
+elif grep -Eiq 'permission denied|authentication failed|could not read username|403|not found' "$push_log"; then
+    diag "GitHub authentication, access, or repository URL problem. Fix access, then retry."
+    hint "git push"
+else
+    diag "see the Git error above. Fix its cause, then retry."
+    hint "git push"
+fi
+
+printf '\n' >&2
+exit 1

@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Fake 'mariadb' client, used ONLY by the test suite. State lives in $FAKE_DB_DIR.
+# Failure/behaviour injection: FAKE_FAIL_ON=GRANT, FAKE_SLEEP_AFTER_GRANT=N,
+# FAKE_BREAK_HISTORY=<history path> (turns the history file into a directory
+# right after a GRANT is applied).
+set -u
+D="${FAKE_DB_DIR:?FAKE_DB_DIR is required}"
+touch "$D"/{databases,users,dbgrants,tableprivs,globals,variables}
+
+sql=''; prev=''
+for a in "$@"; do
+    [[ "$prev" == '-e' ]] && sql="$a"
+    prev="$a"
+done
+[[ -n "$sql" ]] || sql="$(cat)"
+sql="$(tr '\n' ' ' <<<"$sql" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+nsql="${sql//\'/\"}"
+printf '%s\n' "$sql" >>"$D/sql.log"
+
+has()  { [[ "$sql" == *"$1"* ]]; }
+unq()  { local v="$1"; v="${v//\\\\/\\}"; v="${v//\'\'/\'}"; printf '%s' "$v"; }
+fail() { echo "ERROR 1234 (HY000): $1" >&2; exit 1; }
+user_exists() { grep -Fxq "$1"$'\t'"$2" "$D/users"; }
+
+like_match() { # like_match NAME PATTERN  (MariaDB LIKE with backslash escape)
+    local name="$1" pat="$2" re='' i c
+    for ((i = 0; i < ${#pat}; i++)); do
+        c="${pat:i:1}"
+        if [[ "$c" == '\' ]]; then i=$((i + 1)); c="${pat:i:1}"; fi
+        case "${pat:i:1}" in
+            '%') [[ "${pat:i-1:1}" == '\' ]] && re+='%' || re+='.*' ;;
+            '_') [[ "${pat:i-1:1}" == '\' ]] && re+='_' || re+='.' ;;
+            *)   [[ "$c" =~ [A-Za-z0-9] ]] && re+="$c" || re+="\\$c" ;;
+        esac
+    done
+    [[ "$name" =~ ^${re}$ ]]
+}
+
+priv_count() { # priv_count USER DB match|other
+    local u="$1" d="$2" mode="$3" n=0 user host pat db tbl
+    while IFS=$'\t' read -r user host pat; do
+        [[ "$user" == "$u" && "$host" == '%' ]] || continue
+        if like_match "$d" "$pat"; then [[ "$mode" == match ]] && n=$((n + 1)); else [[ "$mode" == other ]] && n=$((n + 1)); fi
+    done <"$D/dbgrants"
+    while IFS=$'\t' read -r user host db tbl; do
+        [[ "$user" == "$u" && "$host" == '%' ]] || continue
+        if [[ "$db" == "$d" ]]; then [[ "$mode" == match ]] && n=$((n + 1)); else [[ "$mode" == other ]] && n=$((n + 1)); fi
+    done <"$D/tableprivs"
+    echo "$n"
+}
+
+# ------------------------------------------------------------------ reads
+if [[ "$sql" == 'SELECT 1' ]]; then echo 1; exit 0; fi
+if has 'information_schema.SCHEMATA'; then cat "$D/databases"; exit 0; fi
+if has "FROM mysql.user WHERE User <> ''"; then sort -t $'\t' -k1,1 -k2,2 "$D/users"; exit 0; fi
+if has "SELECT DISTINCT User FROM mysql.user WHERE Host = 'localhost'"; then
+    awk -F '\t' '$2=="localhost" && $1!="root" && $1!="mariadb.sys" && $1!="mysql" { print $1 }' "$D/users" | sort -u; exit 0
+fi
+if has "SELECT COUNT(*) FROM mysql.user WHERE Host = '%'"; then
+    awk -F '\t' '$2=="%" { n++ } END { print n+0 }' "$D/users"; exit 0
+fi
+if has "SELECT User FROM mysql.user WHERE Host = '%' AND User <> ''"; then
+    awk -F '\t' '$2=="%" && $1!="" { print $1 }' "$D/users" | sort; exit 0
+fi
+re='SELECT COUNT\(\*\) FROM mysql\.user WHERE User = "([^"]*)" AND Host = "([^"]*)"'
+if [[ "$nsql" =~ $re ]]; then
+    grep -Fxc "${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}" "$D/users" || true; exit 0
+fi
+if has 'SELECT (SELECT COUNT(*) FROM mysql.db'; then
+    [[ "$nsql" =~ User\ =\ \"([^\"]*)\" ]] && u="${BASH_REMATCH[1]}"
+    [[ "$nsql" =~ \"([^\"]*)\"\ LIKE\ Db ]] && d="$(unq "${BASH_REMATCH[1]}")"
+    if has 'NOT ('; then priv_count "$u" "$d" other; else priv_count "$u" "$d" match; fi
+    exit 0
+fi
+re='SELECT Db FROM mysql\.db WHERE User = "([^"]*)" AND Host = "%" AND Db IN \("([^"]*)", "([^"]*)"\)'
+if [[ "$nsql" =~ $re ]]; then
+    u="${BASH_REMATCH[1]}"; a="$(unq "${BASH_REMATCH[2]}")"; b="$(unq "${BASH_REMATCH[3]}")"
+    while IFS=$'\t' read -r user host pat; do
+        [[ "$user" == "$u" && "$host" == '%' && ( "$pat" == "$a" || "$pat" == "$b" ) ]] && echo "$pat"
+    done <"$D/dbgrants"
+    exit 0
+fi
+re='SHOW GRANTS FOR "([^"]*)"@"([^"]*)"'
+if [[ "$nsql" =~ $re ]]; then
+    u="${BASH_REMATCH[1]}"; h="${BASH_REMATCH[2]}"
+    user_exists "$u" "$h" || fail "There is no such grant defined for user '$u' on host '$h'"
+    echo "GRANT USAGE ON *.* TO \`$u\`@\`$h\` IDENTIFIED BY PASSWORD '*FAKEHASH'"
+    grep -Fxq "$u"$'\t'"$h" "$D/globals" && echo "GRANT SELECT ON *.* TO \`$u\`@\`$h\`"
+    while IFS=$'\t' read -r user host pat; do
+        [[ "$user" == "$u" && "$host" == "$h" ]] && echo "GRANT ALL PRIVILEGES ON \`$pat\`.* TO \`$u\`@\`$h\`"
+    done <"$D/dbgrants"
+    while IFS=$'\t' read -r user host db tbl; do
+        [[ "$user" == "$u" && "$host" == "$h" ]] && echo "GRANT SELECT ON \`$db\`.\`$tbl\` TO \`$u\`@\`$h\`"
+    done <"$D/tableprivs"
+    exit 0
+fi
+if has 'SHOW GLOBAL VARIABLES'; then
+    names="$(grep -o "'[^']*'" <<<"${sql#*Variable_name}" | tr -d "'")"
+    while IFS=$'\t' read -r k v; do
+        grep -Fxq "$k" <<<"$names" && printf '%s\t%s\n' "$k" "$v"
+    done <"$D/variables"
+    exit 0
+fi
+
+# ----------------------------------------------------------------- writes
+rc=0; handled=0
+IFS=';' read -ra stmts <<<"$nsql"
+for s in "${stmts[@]}"; do
+    s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+    [[ -n "$s" ]] || continue
+    re='^CREATE USER "([^"]*)"@"([^"]*)" IDENTIFIED BY '
+    if [[ "$s" =~ $re ]]; then
+        handled=1
+        user_exists "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" && fail "Operation CREATE USER failed"
+        printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >>"$D/users"; continue
+    fi
+    re='^GRANT ALL PRIVILEGES ON `(.*)`\.\* TO "([^"]*)"@"([^"]*)"$'
+    if [[ "$s" =~ $re ]]; then
+        handled=1
+        [[ "${FAKE_FAIL_ON:-}" == 'GRANT' ]] && fail "Injected GRANT failure"
+        pat="${BASH_REMATCH[1]//\`\`/\`}"
+        grep -Fxq "${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}"$'\t'"$pat" "$D/dbgrants" \
+            || printf '%s\t%s\t%s\n' "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "$pat" >>"$D/dbgrants"
+        [[ -n "${FAKE_SLEEP_AFTER_GRANT:-}" ]] && sleep "$FAKE_SLEEP_AFTER_GRANT"
+        if [[ -n "${FAKE_BREAK_HISTORY:-}" ]]; then rm -f "$FAKE_BREAK_HISTORY"; mkdir -p "$FAKE_BREAK_HISTORY"; fi
+        continue
+    fi
+    re='^REVOKE ALL PRIVILEGES, GRANT OPTION ON `(.*)`\.\* FROM "([^"]*)"@"([^"]*)"$'
+    if [[ "$s" =~ $re ]]; then
+        handled=1
+        pat="${BASH_REMATCH[1]//\`\`/\`}"
+        grep -Fxv "${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}"$'\t'"$pat" "$D/dbgrants" >"$D/dbgrants.new"; mv "$D/dbgrants.new" "$D/dbgrants"
+        continue
+    fi
+    re='^DROP USER (IF EXISTS )?"([^"]*)"@"([^"]*)"$'
+    if [[ "$s" =~ $re ]]; then
+        handled=1
+        u="${BASH_REMATCH[2]}"; h="${BASH_REMATCH[3]}"
+        if ! user_exists "$u" "$h"; then [[ -n "${BASH_REMATCH[1]}" ]] || fail "Operation DROP USER failed"; continue; fi
+        for f in users globals; do grep -Fxv "$u"$'\t'"$h" "$D/$f" >"$D/$f.new"; mv "$D/$f.new" "$D/$f"; done
+        for f in dbgrants tableprivs; do awk -F '\t' -v u="$u" -v h="$h" '!($1==u && $2==h)' "$D/$f" >"$D/$f.new"; mv "$D/$f.new" "$D/$f"; done
+        continue
+    fi
+    echo "fake mariadb: unhandled statement: $s" >&2; exit 2
+done
+exit "$rc"

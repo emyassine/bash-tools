@@ -1,0 +1,987 @@
+#!/usr/bin/env bash
+#
+# yas-transcribe - turn one or more video/audio links into readable transcripts.
+#
+# Pipeline per link:  yt-dlp download -> ffmpeg 16 kHz mono WAV -> faster-whisper
+# -> a single, tidy text or Markdown document.
+#
+# Everything it needs is discovered at runtime (no absolute paths baked in):
+#   * helpers       : yt-dlp, ffmpeg, python3 (uv/pipx/pip to bootstrap)
+#   * private venv  : ${XDG_DATA_HOME:-~/.local/share}/yas-transcribe/venv
+#   * model cache   : ${XDG_DATA_HOME:-~/.local/share}/yas-transcribe/models
+#   * scratch space : mktemp -d inside ${TMPDIR:-/tmp}, removed on exit
+#
+# Environment overrides: YAS_TRANSCRIBE_HOME, YAS_TRANSCRIBE_MODEL,
+# YAS_TRANSCRIBE_FORMAT, YAS_TRANSCRIBE_KEEP_WORK, NO_COLOR.
+#
+# Usage:
+#   yas-transcribe "https://a, https://b" out.txt
+#   yas-transcribe "['https://a', 'https://b']" -o out.md --format md
+#
+# License: MPL-2.0
+
+set -u
+
+YAS_TRANSCRIBE_VERSION='2026.11.12-1'
+
+# ------------------------------- Colors -------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RESET=$'\033[0m'; BOLD=$'\033[1m'; DIM=$'\033[2m'
+    RED=$'\033[31m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    BLUE=$'\033[34m'; MAGENTA=$'\033[35m'; CYAN=$'\033[36m'
+else
+    RESET=''; BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''
+    BLUE=''; MAGENTA=''; CYAN=''
+fi
+
+step()  { printf '\n%s%s==>%s %s%s%s\n' "$BOLD" "$BLUE" "$RESET" "$BOLD" "$*" "$RESET"; }
+ok()    { printf '  %s[OK]%s %s\n' "$GREEN" "$RESET" "$*"; }
+info()  { printf '  %s[i]%s  %s\n' "$CYAN" "$RESET" "$*"; }
+warn()  { printf '  %s[!]%s  %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+dim()   { printf '      %s%s%s\n' "$DIM" "$*" "$RESET"; }
+err()   { printf '  %s[ERROR]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+die()   { err "$*"; exit 2; }
+
+usage() {
+    cat <<'EOF'
+Usage:
+  yas-transcribe <links> [output-file] [options]
+
+Links:
+  One or more URLs, separated by commas, semicolons, spaces or newlines.
+  A PHP-style array is accepted too: "['https://a', 'https://b']".
+
+  yas-transcribe "https://a, https://b" transcripts.txt
+  yas-transcribe "['https://a','https://b']" -o transcripts.md --format md
+
+Options:
+  -o, --out FILE        Output file (default: ./transcriptions-<date>.txt)
+                        A directory is also accepted: a dated file is created there.
+      --format FMT      text (default) or md
+      --model NAME      Whisper model: tiny|base|small|medium|large-v3|... (default: small)
+      --model-dir DIR   Model cache (default: standard Hugging Face cache)
+      --data-dir DIR    Root for venv + models (default: ~/.local/share/yas-transcribe)
+      --language CODE   Spoken language, or "auto" (default: auto)
+      --prompt TEXT     Hint words/names to improve spelling
+      --caption         Also print the post caption (truncated) in each header
+      --device DEV      cpu (default) or cuda
+      --compute TYPE    int8 (default), int8_float16, float16, float32
+  -t, --timestamps      Keep a [mm:ss] marker on every caption line
+      --cookies FILE    Pass a Netscape cookies file to yt-dlp
+      --cookies-from-browser B   Read cookies from a browser (e.g. firefox)
+      --workdir DIR     Parent directory for scratch files (default: $TMPDIR)
+      --keep            Keep downloaded media, audio and scratch files
+  -f, --force           Overwrite the output file without asking
+  -y, --yes             Answer "yes" to every install/download question
+      --dry-run         Show the plan (links, output, model) and stop
+      --check           Report which dependencies and models are available
+      --setup           Install missing dependencies and model, then stop
+  -h, --help            Show this help
+  -V, --version         Show the version
+
+Notes:
+  * First run creates a private Python environment (~120 MB) and downloads the
+    chosen model (tiny ~75 MB ... large-v3 ~3.1 GB). Both steps ask first.
+  * Transcription is machine-generated and may contain errors.
+EOF
+}
+
+# --------------------------- Small helpers ---------------------------
+have() { command -v -- "$1" >/dev/null 2>&1; }
+
+# Find a binary, tolerating common user-local locations that may be off PATH.
+find_exe() {
+    local name=$1 candidate
+    if candidate=$(command -v -- "$name" 2>/dev/null) && [[ -n "$candidate" ]]; then
+        printf '%s\n' "$candidate"; return 0
+    fi
+    for candidate in \
+        "${HOME:-}/.local/bin/$name" \
+        "${HOME:-}/bin/$name" \
+        "${UV_TOOL_BIN_DIR:-}/$name" \
+        /opt/homebrew/bin/"$name" \
+        /usr/local/bin/"$name"; do
+        [[ -n "$candidate" && -x "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+# Prompt that degrades gracefully: --yes always agrees, no TTY never silently does.
+ask_yes_no() {
+    local question=$1 default=${2:-y} reply
+    if (( ASSUME_YES )); then
+        info "$question -> yes (--yes)"
+        return 0
+    fi
+    if [[ ! -t 0 ]]; then
+        warn "$question"
+        warn "Non-interactive session: re-run with --yes to allow this automatically."
+        return 1
+    fi
+    if [[ "$default" == y ]]; then
+        printf '  %s?%s %s [Y/n] ' "$YELLOW" "$RESET" "$question"
+    else
+        printf '  %s?%s %s [y/N] ' "$YELLOW" "$RESET" "$question"
+    fi
+    IFS= read -r reply || reply=''
+    reply=${reply:-$default}
+    case "$reply" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+run_with_spinner() {
+    local label=$1 log=$2
+    shift 2
+    "$@" >"$log" 2>&1 &
+    local pid=$! i=0 status=0
+    local frames=('|' '/' '-' '\')
+    if [[ -t 1 ]]; then
+        printf '\033[?25l'
+        while kill -0 "$pid" 2>/dev/null; do
+            printf '\r  %s%s%s %s' "$CYAN" "${frames[i % 4]}" "$RESET" "$label"
+            i=$((i + 1))
+            sleep 0.1
+        done
+        printf '\r\033[K\033[?25h'
+    fi
+    wait "$pid" 2>/dev/null || status=$?
+    return "$status"
+}
+
+# --------------------------- Configuration ---------------------------
+MODEL="${YAS_TRANSCRIBE_MODEL:-small}"
+FORMAT="${YAS_TRANSCRIBE_FORMAT:-text}"
+LANGUAGE="${YAS_TRANSCRIBE_LANGUAGE:-auto}"
+DEVICE="${YAS_TRANSCRIBE_DEVICE:-cpu}"
+COMPUTE="${YAS_TRANSCRIBE_COMPUTE:-int8}"
+PROMPT_TEXT=''
+COOKIES=''
+COOKIES_BROWSER=''
+OUTPUT=''
+WORK_PARENT="${TMPDIR:-/tmp}"
+KEEP_WORK="${YAS_TRANSCRIBE_KEEP_WORK:-0}"
+FORCE=0
+ASSUME_YES=0
+SHOW_CAPTION=0
+TIMESTAMPS=0
+DRY_RUN=0
+CHECK_ONLY=0
+SETUP_ONLY=0
+
+DATA_HOME="${YAS_TRANSCRIBE_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/yas-transcribe}"
+# Reuse the standard Hugging Face cache so models downloaded by other tools are found.
+HF_BASE="${HF_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/huggingface}"
+MODEL_DIR="${YAS_TRANSCRIBE_MODEL_DIR:-${HF_HUB_CACHE:-$HF_BASE/hub}}"
+VENV="$DATA_HOME/venv"
+WORK=''
+LINKS=()
+FAIL_MSG=()
+FAILED_COUNT=0
+TOTAL=0
+
+# ------------------------------ Options ------------------------------
+POSITIONALS=()
+while (( $# )); do
+    case "$1" in
+        -h|--help)     usage; exit 0 ;;
+        -V|--version)  printf 'yas-transcribe %s\n' "$YAS_TRANSCRIBE_VERSION"; exit 0 ;;
+        -o|--out|--output)
+            (( $# >= 2 )) || die "$1 needs a file name"
+            OUTPUT=$2; shift ;;
+        --out=*|--output=*) OUTPUT=${1#*=} ;;
+        --model)
+            (( $# >= 2 )) || die "$1 needs a model name"
+            MODEL=$2; shift ;;
+        --model=*) MODEL=${1#*=} ;;
+        --model-dir)
+            (( $# >= 2 )) || die "$1 needs a directory"
+            MODEL_DIR=$2; shift ;;
+        --model-dir=*) MODEL_DIR=${1#*=} ;;
+        --data-dir)
+            (( $# >= 2 )) || die "$1 needs a directory"
+            DATA_HOME=$2; VENV="$DATA_HOME/venv"; shift ;;
+        --data-dir=*) DATA_HOME=${1#*=}; VENV="$DATA_HOME/venv" ;;
+        --format)
+            (( $# >= 2 )) || die "$1 needs text|md"
+            FORMAT=$2; shift ;;
+        --format=*) FORMAT=${1#*=} ;;
+        --language|--lang)
+            (( $# >= 2 )) || die "$1 needs a language code or auto"
+            LANGUAGE=$2; shift ;;
+        --language=*|--lang=*) LANGUAGE=${1#*=} ;;
+        --prompt)
+            (( $# >= 2 )) || die "$1 needs text"
+            PROMPT_TEXT=$2; shift ;;
+        --prompt=*) PROMPT_TEXT=${1#*=} ;;
+        --caption) SHOW_CAPTION=1 ;;
+        --device)
+            (( $# >= 2 )) || die "$1 needs cpu|cuda"
+            DEVICE=$2; shift ;;
+        --device=*) DEVICE=${1#*=} ;;
+        --compute)
+            (( $# >= 2 )) || die "$1 needs a compute type"
+            COMPUTE=$2; shift ;;
+        --compute=*) COMPUTE=${1#*=} ;;
+        -t|--timestamps) TIMESTAMPS=1 ;;
+        --cookies)
+            (( $# >= 2 )) || die "$1 needs a file"
+            COOKIES=$2; shift ;;
+        --cookies=*) COOKIES=${1#*=} ;;
+        --cookies-from-browser)
+            (( $# >= 2 )) || die "$1 needs a browser name"
+            COOKIES_BROWSER=$2; shift ;;
+        --cookies-from-browser=*) COOKIES_BROWSER=${1#*=} ;;
+        --workdir)
+            (( $# >= 2 )) || die "$1 needs a directory"
+            WORK_PARENT=$2; shift ;;
+        --workdir=*) WORK_PARENT=${1#*=} ;;
+        --keep)  KEEP_WORK=1 ;;
+        -f|--force) FORCE=1 ;;
+        -y|--yes)   ASSUME_YES=1 ;;
+        --dry-run)  DRY_RUN=1 ;;
+        --check)    CHECK_ONLY=1 ;;
+        --setup)    SETUP_ONLY=1 ;;
+        --) shift; while (( $# )); do POSITIONALS+=("$1"); shift; done; break ;;
+        -*) die "unknown option: $1 (try --help)" ;;
+        *)  POSITIONALS+=("$1") ;;
+    esac
+    shift
+done
+
+case "$FORMAT" in
+    text|txt|plain) FORMAT=text ;;
+    md|markdown)    FORMAT=md ;;
+    *) die "unsupported --format '$FORMAT' (use text or md)" ;;
+esac
+
+# --------------------------- Link parsing ---------------------------
+# Accepts: "a, b" | "a b" | "['a','b']" | "a;b" | multiple arguments.
+parse_links() {
+    local raw=$1 token line existing duplicate
+    raw=$(printf '%s' "$raw" | sed -e 's/[][]//g' -e "s/[\"']//g" | tr -s '[:space:],;' '\n')
+    LINKS=()
+    while IFS= read -r line; do
+        token=$line
+        token=$(printf '%s' "$token" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        [[ -z "$token" ]] && continue
+        case "$token" in
+            http://*|https://*) ;;
+            *) die "not a URL: '$token'" ;;
+        esac
+        duplicate=0
+        for existing in "${LINKS[@]+"${LINKS[@]}"}"; do
+            [[ "$existing" == "$token" ]] && { duplicate=1; break; }
+        done
+        (( duplicate )) || LINKS+=("$token")
+    done <<<"$raw"
+}
+
+LINKS_SPEC=''
+if (( ${#POSITIONALS[@]} )); then
+    last_index=$(( ${#POSITIONALS[@]} - 1 ))
+    last=${POSITIONALS[last_index]}
+    if [[ -z "$OUTPUT" ]] && (( ${#POSITIONALS[@]} >= 2 )) && [[ "$last" != *://* ]]; then
+        OUTPUT=$last
+        unset 'POSITIONALS[last_index]'
+    fi
+    for value in "${POSITIONALS[@]}"; do
+        if [[ -z "$LINKS_SPEC" ]]; then LINKS_SPEC=$value; else LINKS_SPEC="$LINKS_SPEC $value"; fi
+    done
+fi
+
+if [[ -n "$LINKS_SPEC" ]]; then
+    parse_links "$LINKS_SPEC"
+fi
+
+# ------------------------- Environment checks ------------------------
+model_repo() {
+    case "$1" in
+        */*) printf '%s' "$1" ;;
+        distil-*) printf 'Systran/faster-distil-whisper-%s' "${1#distil-}" ;;
+        tiny|tiny.en|base|base.en|small|small.en|medium|medium.en|large-v1|large-v2|large-v3|large-v3-turbo)
+            printf 'Systran/faster-whisper-%s' "$1" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+model_size() {
+    case "$1" in
+        tiny|tiny.en)              printf '~75 MB' ;;
+        base|base.en)              printf '~145 MB' ;;
+        small|small.en)            printf '~480 MB' ;;
+        medium|medium.en)          printf '~1.5 GB' ;;
+        large-v1|large-v2)         printf '~3.0 GB' ;;
+        large-v3)                  printf '~3.1 GB' ;;
+        large-v3-turbo|turbo)      printf '~1.6 GB' ;;
+        distil-*)                  printf '~750 MB' ;;
+        *)                         printf 'unknown size' ;;
+    esac
+}
+
+detect_pkg_manager() {
+    local manager
+    for manager in apt-get dnf yum pacman zypper apk brew; do
+        have "$manager" && { printf '%s' "$manager"; return 0; }
+    done
+    return 1
+}
+
+pkg_install_command() {
+    case "$1" in
+        apt-get) printf 'sudo apt-get install -y %s' "$2" ;;
+        dnf|yum) printf 'sudo %s install -y %s' "$1" "$2" ;;
+        pacman)  printf 'sudo pacman -S --needed --noconfirm %s' "$2" ;;
+        zypper)  printf 'sudo zypper install -y %s' "$2" ;;
+        apk)     printf 'sudo apk add %s' "$2" ;;
+        brew)    printf 'brew install %s' "$2" ;;
+    esac
+}
+
+ensure_ffmpeg() {
+    local manager install_cmd log
+    if FFMPEG=$(find_exe ffmpeg); then
+        ok "ffmpeg: $FFMPEG"
+        return 0
+    fi
+    warn "ffmpeg is missing (needed to extract audio)."
+    if ! manager=$(detect_pkg_manager); then
+        err "Install ffmpeg with your system package manager, then re-run."
+        return 1
+    fi
+    install_cmd=$(pkg_install_command "$manager" ffmpeg)
+    if ! ask_yes_no "Install ffmpeg now ($install_cmd)?" y; then
+        err "ffmpeg is required. Run: $install_cmd"
+        return 1
+    fi
+    log="$WORK/install-ffmpeg.log"
+    if ! run_with_spinner "Installing ffmpeg..." "$log" bash -c "$install_cmd"; then
+        err "ffmpeg installation failed. Output: $log"
+        tail -n 15 "$log" >&2
+        return 1
+    fi
+    FFMPEG=$(find_exe ffmpeg) || { err "ffmpeg still not found after install."; return 1; }
+    ok "ffmpeg installed: $FFMPEG"
+}
+
+ensure_ytdlp() {
+    local log
+    if YTDLP=$(find_exe yt-dlp); then
+        ok "yt-dlp: $YTDLP"
+        return 0
+    fi
+    warn "yt-dlp is missing (needed to download the links)."
+    if ! ask_yes_no "Install yt-dlp now?" y; then
+        err "yt-dlp is required. Install it with 'uv tool install yt-dlp' or your package manager."
+        return 1
+    fi
+    log="$WORK/install-ytdlp.log"
+    if have uv; then
+        run_with_spinner "Installing yt-dlp (uv)..." "$log" uv tool install yt-dlp
+    elif have pipx; then
+        run_with_spinner "Installing yt-dlp (pipx)..." "$log" pipx install yt-dlp
+    elif have python3; then
+        if ! run_with_spinner "Installing yt-dlp (pip)..." "$log" python3 -m pip install --user yt-dlp; then
+            run_with_spinner "Retrying yt-dlp install (pip, PEP 668)..." "$log" \
+                python3 -m pip install --user --break-system-packages yt-dlp
+        fi
+    else
+        err "No installer available. Install yt-dlp manually, then re-run."
+        return 1
+    fi
+    if ! YTDLP=$(find_exe yt-dlp); then
+        err "yt-dlp is still not on PATH. Add ~/.local/bin to PATH or install it with your package manager."
+        return 1
+    fi
+    ok "yt-dlp installed: $YTDLP"
+}
+
+ensure_venv() {
+    local log python3
+    if [[ -x "$VENV/bin/python" ]] && "$VENV/bin/python" -c 'import faster_whisper, numpy' >/dev/null 2>&1; then
+        ok "Speech engine: $VENV"
+        return 0
+    fi
+    python3=$(find_exe python3) || { err "python3 is required."; return 1; }
+    info "The speech engine (faster-whisper) is not installed yet."
+    info "It lives in a private environment: $VENV (~120 MB, nothing global is touched)."
+    if ! ask_yes_no "Create that environment now?" y; then
+        err "Cannot transcribe without the speech engine."
+        return 1
+    fi
+    mkdir -p "$DATA_HOME" || { err "Cannot create $DATA_HOME"; return 1; }
+    log="$WORK/install-venv.log"
+    if have uv; then
+        if ! run_with_spinner "Creating environment (uv)..." "$log" uv venv "$VENV"; then
+            err "Could not create the environment."; tail -n 15 "$log" >&2; return 1
+        fi
+        if ! run_with_spinner "Installing faster-whisper..." "$log" \
+                uv pip install --python "$VENV/bin/python" faster-whisper; then
+            err "Could not install faster-whisper."; tail -n 15 "$log" >&2; return 1
+        fi
+    else
+        if ! run_with_spinner "Creating environment (python3 -m venv)..." "$log" \
+                "$python3" -m venv "$VENV"; then
+            err "Could not create the environment. Install 'python3-venv' and retry."
+            tail -n 15 "$log" >&2
+            return 1
+        fi
+        "$VENV/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+        if ! run_with_spinner "Installing faster-whisper..." "$log" \
+                "$VENV/bin/python" -m pip install --disable-pip-version-check faster-whisper; then
+            err "Could not install faster-whisper."; tail -n 15 "$log" >&2; return 1
+        fi
+    fi
+    if ! "$VENV/bin/python" -c 'import faster_whisper, numpy' >/dev/null 2>&1; then
+        err "The environment was created but faster-whisper cannot be imported."
+        return 1
+    fi
+    ok "Speech engine ready: $VENV"
+}
+
+ensure_model() {
+    local repo state log
+    repo=$(model_repo "$MODEL")
+    mkdir -p "$MODEL_DIR" || { err "Cannot create model directory: $MODEL_DIR"; return 1; }
+    state=$("$VENV/bin/python" "$PY_DIR/model_check.py" "$repo" "$MODEL_DIR" 2>/dev/null || printf 'missing')
+    if [[ "$state" == cached ]]; then
+        ok "Model '$MODEL' already cached in $MODEL_DIR"
+        return 0
+    fi
+    info "Model '$MODEL' is not downloaded yet ($(model_size "$MODEL"))."
+    info "It will be stored in: $MODEL_DIR"
+    if ! ask_yes_no "Download model '$MODEL' now?" y; then
+        err "Cannot transcribe without the model. Re-run with --yes to allow the download."
+        return 1
+    fi
+    log="$WORK/download-model.log"
+    if ! run_with_spinner "Downloading model '$MODEL' ($(model_size "$MODEL"))..." "$log" \
+            "$VENV/bin/python" "$PY_DIR/model_download.py" "$repo" "$MODEL_DIR"; then
+        err "Model download failed. Output: $log"
+        tail -n 15 "$log" >&2
+        return 1
+    fi
+    state=$("$VENV/bin/python" "$PY_DIR/model_check.py" "$repo" "$MODEL_DIR" 2>/dev/null || printf 'missing')
+    if [[ "$state" != cached ]]; then
+        err "The model is still missing after downloading; check the log: $log"
+        return 1
+    fi
+    ok "Model '$MODEL' ready."
+}
+
+setup_environment() {
+    ensure_ffmpeg || return 1
+    ensure_ytdlp || return 1
+    ensure_venv || return 1
+    ensure_model || return 1
+}
+
+report_status() {
+    local repo state
+    printf '\n%s%s yas-transcribe %s - environment check %s\n' \
+        "$BOLD" "$MAGENTA" "$YAS_TRANSCRIBE_VERSION" "$RESET"
+    if FFMPEG=$(find_exe ffmpeg); then ok "ffmpeg:  $FFMPEG"; else warn "ffmpeg:  missing"; fi
+    if YTDLP=$(find_exe yt-dlp); then ok "yt-dlp:  $YTDLP"; else warn "yt-dlp:  missing"; fi
+    if [[ -x "$VENV/bin/python" ]] && "$VENV/bin/python" -c 'import faster_whisper' >/dev/null 2>&1; then
+        ok "engine:  $VENV"
+        repo=$(model_repo "$MODEL")
+        mkdir -p "$MODEL_DIR" 2>/dev/null || true
+        state=$("$VENV/bin/python" "$PY_DIR/model_check.py" "$repo" "$MODEL_DIR" 2>/dev/null || printf 'missing')
+        if [[ "$state" == cached ]]; then
+            ok "model:   $MODEL ($MODEL_DIR)"
+        else
+            warn "model:   $MODEL not cached ($(model_size "$MODEL") to download)"
+        fi
+    else
+        warn "engine:  missing ($VENV)"
+        warn "model:   cannot check without the engine"
+    fi
+    printf '\n'
+}
+
+# ---------------------------- Python side ----------------------------
+write_helpers() {
+    PY_DIR="$WORK/py"
+    mkdir -p "$PY_DIR" || die "Cannot create $PY_DIR"
+
+    cat > "$PY_DIR/transcribe.py" <<'PY'
+"""Transcribe one WAV file with faster-whisper, keep only readable prose."""
+import os
+import sys
+import wave
+
+import numpy as np
+
+
+def load_wav(path):
+    with wave.open(path, "rb") as handle:
+        if handle.getnchannels() != 1 or handle.getsampwidth() != 2:
+            raise SystemExit(
+                "yas-transcribe: expected 16-bit mono WAV, got %s" % path
+            )
+        raw = handle.readframes(handle.getnframes())
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def stamp(seconds):
+    total = max(0, int(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%02d:%02d" % (minutes, secs)
+
+
+def main(argv):
+    (audio, model_name, language, timestamps, prompt,
+     out_path, model_dir, device, compute) = argv[1:10]
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        sys.stderr.write("yas-transcribe: faster-whisper is not importable\n")
+        return 3
+
+    samples = load_wav(audio)
+    model = WhisperModel(
+        model_name,
+        device=device or "cpu",
+        compute_type=compute or "int8",
+        download_root=model_dir or None,
+        cpu_threads=max(1, min(8, os.cpu_count() or 4)),
+    )
+
+    def decode(forced_language):
+        stream, details = model.transcribe(
+            samples,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+            language=forced_language,
+            initial_prompt=prompt or None,
+        )
+        collected = list(stream)
+        if collected:
+            score = sum(s.avg_logprob for s in collected) / len(collected)
+        else:
+            score = -9.0
+        return collected, details, score
+
+    requested = None if language in ("", "auto") else language
+    segments, info, score = decode(requested)
+
+    # Accented speech often fools language auto-detection (e.g. Slovenian speaker,
+    # English words). When detection is unsure, try English and keep the better pass.
+    if requested is None and info.language_probability < 0.5 and info.language != "en":
+        retry_segments, retry_info, retry_score = decode("en")
+        if retry_score > score:
+            segments, info, score = retry_segments, retry_info, retry_score
+
+    # Group captions into paragraphs: a pause longer than ~1.2 s starts a new one.
+    blocks, current, previous_end, chars = [], [], None, 0
+    for segment in segments:
+        text = (segment.text or "").strip()
+        if not text:
+            continue
+        if timestamps == "1":
+            blocks.append("[%s] %s" % (stamp(segment.start), text))
+        else:
+            pause = previous_end is not None and segment.start - previous_end > 1.2
+            finished_sentence = bool(current) and current[-1][-1:] in ".!?\"')"
+            long_paragraph = chars >= 450 and finished_sentence
+            if current and ((pause and finished_sentence) or long_paragraph):
+                blocks.append(" ".join(current))
+                current = []
+                chars = 0
+            current.append(text)
+            chars += len(text) + 1
+        previous_end = segment.end
+    if current:
+        blocks.append(" ".join(current))
+
+    body = "\n\n".join(blocks).strip()
+    with open(out_path, "w", encoding="utf-8") as handle:
+        if body:
+            handle.write(body + "\n")
+
+    probability = getattr(info, "language_probability", 0.0) or 0.0
+    print("DETECT\t%s\t%.2f\t%.1f" % (
+        getattr(info, "language", "") or "unknown",
+        probability,
+        len(samples) / 16000.0,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+PY
+
+    cat > "$PY_DIR/meta.py" <<'PY'
+"""Print yt-dlp info.json fields as one unit-separated record."""
+import json
+import sys
+
+path = sys.argv[1]
+data = {}
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except Exception:
+    pass
+
+
+def field(key):
+    value = data.get(key)
+    return "" if value is None else str(value)
+
+
+def collapse(value):
+    return " ".join(value.split())
+
+
+upload_date = field("upload_date")
+if len(upload_date) == 8 and upload_date.isdigit():
+    upload_date = "%s-%s-%s" % (upload_date[:4], upload_date[4:6], upload_date[6:])
+
+duration = field("duration")
+try:
+    duration = str(int(round(float(duration))))
+except Exception:
+    duration = ""
+
+record = [
+    collapse(field("uploader")),
+    collapse(field("channel")),
+    collapse(field("uploader_id")).lstrip("@"),
+    duration,
+    upload_date,
+    collapse(field("title")),
+    collapse(field("description")),
+    field("webpage_url"),
+]
+sys.stdout.write("\x1f".join(record))
+PY
+
+    cat > "$PY_DIR/model_check.py" <<'PY'
+"""Report whether a Hugging Face repo is already in the local cache."""
+import sys
+
+repo_id, cache_dir = sys.argv[1], sys.argv[2]
+try:
+    from huggingface_hub import snapshot_download
+except ImportError:
+    print("missing")
+    raise SystemExit(0)
+
+try:
+    snapshot_download(repo_id=repo_id, cache_dir=cache_dir, local_files_only=True)
+except Exception:
+    print("missing")
+else:
+    print("cached")
+PY
+
+    cat > "$PY_DIR/model_download.py" <<'PY'
+"""Download a Hugging Face repo into the given cache directory."""
+import sys
+
+from huggingface_hub import snapshot_download
+
+snapshot_download(repo_id=sys.argv[1], cache_dir=sys.argv[2])
+PY
+}
+
+# ------------------------------ Output ------------------------------
+resolve_output() {
+    local extension='txt' outdir today
+    [[ "$FORMAT" == md ]] && extension='md'
+    today=$(date '+%Y%m%d-%H%M%S')
+
+    if [[ -z "$OUTPUT" ]]; then
+        OUTPUT="$PWD/transcriptions-$today.$extension"
+    elif [[ -d "$OUTPUT" ]]; then
+        OUTPUT="${OUTPUT%/}/transcriptions-$today.$extension"
+    elif [[ "$OUTPUT" == */ ]]; then
+        outdir=${OUTPUT%/}
+        mkdir -p "$outdir" || die "Cannot create output directory: $outdir"
+        OUTPUT="$outdir/transcriptions-$today.$extension"
+    fi
+
+    outdir=$(dirname -- "$OUTPUT")
+    mkdir -p "$outdir" || die "Cannot create output directory: $outdir"
+
+    if [[ -e "$OUTPUT" ]] && (( ! FORCE )); then
+        if ask_yes_no "Output exists: $OUTPUT. Overwrite it?" n; then
+            :
+        else
+            local dir name
+            dir=${OUTPUT%/*}; name=${OUTPUT##*/}
+            [[ "$dir" == "$OUTPUT" ]] && dir='' || dir="$dir/"
+            if [[ "$name" == *.* ]]; then
+                OUTPUT="${dir}${name%.*}-$today.${name##*.}"
+            else
+                OUTPUT="${dir}${name}-$today"
+            fi
+            info "Keeping the existing file; writing to: $OUTPUT"
+        fi
+    fi
+}
+
+# -------------------------- Per-link pipeline ------------------------
+download_link() {
+    local url=$1 index=$2 log="$WORK/download-$2.log"
+    local -a args=(--no-warnings --no-playlist --write-info-json
+                   --paths "$WORK" -o "reel$index.%(ext)s")
+    [[ -n "$COOKIES" ]] && args+=(--cookies "$COOKIES")
+    [[ -n "$COOKIES_BROWSER" ]] && args+=(--cookies-from-browser "$COOKIES_BROWSER")
+    run_with_spinner "Downloading..." "$log" "$YTDLP" "${args[@]}" "$url"
+}
+
+find_media() {
+    local index=$1 candidate
+    for candidate in "$WORK/reel$index".*; do
+        [[ -f "$candidate" ]] || continue
+        case "$candidate" in
+            *.info.json|*.fields|*.part|*.ytdl|*.wav|*.txt|*.lang) continue ;;
+        esac
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
+}
+
+process_link() {
+    local url=$1 index=$2 base="$WORK/reel$2" media log
+
+    if ! download_link "$url" "$index"; then
+        FAIL_MSG[$index]="download failed"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        err "Download failed for $url"
+        log="$WORK/download-$index.log"
+        [[ -s "$log" ]] && tail -n 8 "$log" | while IFS= read -r line; do dim "$line"; done
+        return 1
+    fi
+    ok "Downloaded."
+
+    # Keep the reel's own metadata (account, date, length, caption) for the header.
+    if [[ -f "$WORK/reel$index.info.json" ]]; then
+        "$VENV/bin/python" "$PY_DIR/meta.py" "$WORK/reel$index.info.json" \
+            > "$base.fields" 2>/dev/null || : > "$base.fields"
+    fi
+
+    if ! media=$(find_media "$index"); then
+        FAIL_MSG[$index]="no media file produced"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        err "No media file was produced for $url"
+        return 1
+    fi
+
+    if ! "$FFMPEG" -nostdin -loglevel error -y -i "$media" -vn \
+            -ac 1 -ar 16000 -c:a pcm_s16le "$base.wav" >>"$WORK/ffmpeg-$index.log" 2>&1; then
+        FAIL_MSG[$index]="audio extraction failed"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        err "Could not extract audio from $media"
+        dim "See $WORK/ffmpeg-$index.log"
+        return 1
+    fi
+
+    if ! "$VENV/bin/python" "$PY_DIR/transcribe.py" \
+            "$base.wav" "$MODEL" "$LANGUAGE" "$TIMESTAMPS" "$PROMPT_TEXT" \
+            "$base.txt" "$MODEL_DIR" "$DEVICE" "$COMPUTE" > "$base.lang" 2>"$WORK/whisper-$index.log"; then
+        FAIL_MSG[$index]="transcription failed"
+        FAILED_COUNT=$((FAILED_COUNT + 1))
+        err "Transcription failed for $url"
+        tail -n 8 "$WORK/whisper-$index.log" | while IFS= read -r line; do dim "$line"; done
+        return 1
+    fi
+
+    if [[ -s "$base.txt" ]]; then
+        local words unit
+        words=$(wc -w < "$base.txt" | tr -d ' ')
+        [[ "$words" == 1 ]] && unit=word || unit=words
+        ok "Transcribed ($words $unit)."
+    else
+        ok "Processed; no spoken audio detected."
+    fi
+    return 0
+}
+
+# ----------------------------- Assembly -----------------------------
+write_document() {
+    local tmp="$OUTPUT.tmp.$$" n index url base
+    local account channel uploader_id handle duration upload_date title description page_url label
+    local posted language probability seconds
+
+    {
+        if [[ "$FORMAT" == md ]]; then
+            printf '# Transcriptions\n\n'
+            printf -- '- Generated: %s\n' "$(date '+%Y-%m-%d %H:%M')"
+            printf -- '- Tool: yas-transcribe %s\n' "$YAS_TRANSCRIBE_VERSION"
+            printf -- '- Model: %s\n' "$MODEL"
+            printf -- '- Sources: %d\n' "$TOTAL"
+        else
+            printf 'TRANSCRIPTIONS\n'
+            printf 'Generated %s by yas-transcribe %s\n' "$(date '+%Y-%m-%d %H:%M')" "$YAS_TRANSCRIBE_VERSION"
+            printf 'Model: %s\n' "$MODEL"
+            printf 'Sources: %d\n' "$TOTAL"
+            printf 'Machine transcription, lightly punctuated: expect small errors.\n'
+        fi
+
+        for index in "${!LINKS[@]}"; do
+            n=$((index + 1))
+            url=${LINKS[index]}
+            base="$WORK/reel$n"
+            account=''; channel=''; uploader_id=''; handle=''
+            duration=''; upload_date=''; title=''; description=''; page_url=''
+            if [[ -f "$base.fields" ]]; then
+                IFS=$'\x1f' read -r account channel uploader_id duration upload_date \
+                    title description page_url < "$base.fields"
+            fi
+            handle=$channel
+            [[ -n "$handle" ]] || handle=$uploader_id
+            [[ "$handle" =~ ^[0-9]+$ ]] && handle=''
+            if (( SHOW_CAPTION )) && [[ -n "$description" && "$description" != "Video by"* ]]; then
+                if (( ${#description} > 400 )); then
+                    description="${description:0:400}…"
+                fi
+            else
+                description=''
+            fi
+            label=''
+            if [[ -n "$account" && -n "$handle" && "$handle" != "$account" ]]; then
+                label="$account (@$handle)"
+            elif [[ -n "$account" ]]; then
+                label="$account"
+            elif [[ -n "$handle" ]]; then
+                label="@$handle"
+            fi
+
+            posted=''
+            [[ -n "$upload_date" ]] && posted="$upload_date"
+            [[ -n "$duration" ]] && posted="${posted:+$posted — }length ~${duration}s"
+
+            language=''; probability=''
+            if [[ -f "$base.lang" ]]; then
+                IFS=$'\t' read -r _ language probability seconds < "$base.lang"
+            fi
+
+            if [[ "$FORMAT" == md ]]; then
+                printf '\n## %d. %s\n\n' "$n" "$url"
+                [[ -n "$label" ]] && printf '**Account:** %s  \n' "$label"
+                [[ -n "$posted" ]] && printf '**Posted:** %s  \n' "$posted"
+                [[ -n "$language" ]] && printf '**Detected language:** %s (%s)  \n' "$language" "$probability"
+                [[ -n "$description" ]] && printf '**Caption:** %s\n' "$description"
+                printf '\n'
+            else
+                printf '\n%s\n' '==============================================================================='
+                printf '%d) %s\n' "$n" "$url"
+                [[ -n "$label" ]] && printf '   Account: %s\n' "$label"
+                [[ -n "$posted" ]] && printf '   Posted: %s\n' "$posted"
+                [[ -n "$description" ]] && printf '   Caption: %s\n' "$description"
+                printf '%s\n\n' '==============================================================================='
+            fi
+
+            if [[ -n "${FAIL_MSG[n]:-}" ]]; then
+                printf '[Transcription unavailable: %s]\n' "${FAIL_MSG[n]}"
+                continue
+            fi
+            if [[ -s "$base.txt" ]]; then
+                cat "$base.txt"
+                printf '\n'
+            else
+                printf '[No spoken audio detected in this clip.]\n'
+            fi
+        done
+    } > "$tmp" || { err "Could not write $tmp"; rm -f -- "$tmp"; return 1; }
+
+    if ! mv -f -- "$tmp" "$OUTPUT"; then
+        err "Could not move the document into place: $OUTPUT"
+        rm -f -- "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------- Setup -------------------------------
+cleanup() {
+    [[ -t 1 ]] && printf '\033[?25h'
+    if [[ -n "$WORK" && -d "$WORK" ]]; then
+        if (( KEEP_WORK )); then
+            printf '  %s[i]%s  Scratch files kept: %s\n' "$CYAN" "$RESET" "$WORK"
+        else
+            rm -rf -- "$WORK"
+        fi
+    fi
+}
+
+WORK=$(mktemp -d "${WORK_PARENT%/}/yas-transcribe.XXXXXX") || {
+    err "Cannot create a scratch directory under $WORK_PARENT"
+    exit 1
+}
+trap cleanup EXIT
+trap 'printf "\n"; warn "Interrupted."; exit 130' INT TERM
+
+write_helpers
+
+if (( CHECK_ONLY )); then
+    report_status
+    exit 0
+fi
+
+if (( SETUP_ONLY )); then
+    step "Preparing yas-transcribe"
+    setup_environment || exit 1
+    ok "Ready. Run: yas-transcribe \"<links>\" -y"
+    exit 0
+fi
+
+(( ${#LINKS[@]} )) || { usage >&2; exit 2; }
+TOTAL=${#LINKS[@]}
+
+resolve_output
+
+printf '\n%s%s yas-transcribe %s %s\n' "$BOLD" "$MAGENTA" "$YAS_TRANSCRIBE_VERSION" "$RESET"
+info "Links:  $TOTAL"
+info "Output: $OUTPUT"
+info "Model:  $MODEL ($DEVICE/$COMPUTE), language: $LANGUAGE"
+info "Format: $FORMAT"
+
+if (( DRY_RUN )); then
+    step "Plan"
+    index=1
+    for url in "${LINKS[@]}"; do
+        dim "$index. $url"
+        index=$((index + 1))
+    done
+    info "Dry run: nothing was downloaded or transcribed."
+    exit 0
+fi
+
+step "Checking requirements"
+setup_environment || { err "Setup is incomplete; nothing was transcribed."; exit 1; }
+
+step "Working"
+index=0
+for url in "${LINKS[@]}"; do
+    index=$((index + 1))
+    step "($index/$TOTAL) $url"
+    process_link "$url" "$index"
+done
+
+step "Writing document"
+if ! write_document; then
+    err "The transcript document could not be written."
+    exit 1
+fi
+ok "Saved to: $OUTPUT"
+
+printf '\n'
+if (( FAILED_COUNT )); then
+    warn "$FAILED_COUNT of $TOTAL link(s) failed; they are marked in the document."
+    printf '\n%s%s[PARTIAL]%s\n\n' "$BOLD" "$YELLOW" "$RESET"
+    exit 1
+fi
+printf '%s%s[DONE]%s %d transcript(s) written.\n\n' "$BOLD" "$GREEN" "$RESET" "$TOTAL"
+exit 0

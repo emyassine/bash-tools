@@ -1,0 +1,9 @@
+# Local/runtime artefacts
+*.log
+*.tmp
+transcriptions-*.txt
+transcriptions-*.md
+
+# Never commit cookies or local profiles
+cookies.txt
+*.cookies
