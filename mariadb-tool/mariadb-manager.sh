@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 # MariaDB Manager
 # Interactive CLI to inspect MariaDB and grant/revoke temporary, database-scoped
-# remote access. History is kept beside this script so revocation only ever
-# touches accounts and grants that this tool created.
+# remote access. A separate command can remove any selected remote account.
 set -Eeuo pipefail
 
-VERSION='2.3.0'
+VERSION='2.4.0'
 EDITION='2026'
 RELEASED='November 26, 2026'
-RELEASE_NOTES='Managed history now uses a strict, current record format.'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename -- "${BASH_SOURCE[0]}")"
@@ -59,31 +57,88 @@ Usage:
   ${SCRIPT_NAME} users        List MariaDB accounts
   ${SCRIPT_NAME} remote       Show remote access overview
   ${SCRIPT_NAME} info         Show server information
-  ${SCRIPT_NAME} diagnose     Check whether MariaDB accepts remote connections
-  ${SCRIPT_NAME} grant        Start the "grant remote access" wizard
+  ${SCRIPT_NAME} diagnose     Diagnose MariaDB remote listening
+  ${SCRIPT_NAME} grant        Grant access to one database
   ${SCRIPT_NAME} revoke       Revoke a grant managed by this tool
-  ${SCRIPT_NAME} remove-remote Remove any existing remote account and all its grants
+  ${SCRIPT_NAME} remove-remote Remove a remote account and all its grants
   ${SCRIPT_NAME} --version    Print version information
+  ${SCRIPT_NAME} --about      Print the portable tool guide
   ${SCRIPT_NAME} --help       Show this help
 
-Navigation inside any wizard or menu:
-  back | b      Go back one step
-  quit | q      Exit immediately
-  (password prompts use :back and :quit instead)
-
-Remote grants create (or reuse) an account for host '%' with privileges on ONE
-database only. Revocation only removes what this tool added. Network listening
-(bind-address) and the firewall are never changed by this tool.
+Interactive navigation: back/b, quit/q. Secret prompts use :back and :quit.
 EOF_HELP
+}
+
+about() {
+    cat <<EOF_ABOUT
+${SCRIPT_NAME} ${VERSION} - MariaDB Manager
+
+Purpose
+  Inspect MariaDB accounts and databases, grant remote access to one database,
+  revoke grants managed by this tool, or remove an existing remote account.
+  The tool changes MariaDB accounts and grants only. It does not edit application
+  configuration, MariaDB network settings, services, or firewalls.
+
+Commands
+  ${SCRIPT_NAME}              Open the interactive menu
+  ${SCRIPT_NAME} databases    List user databases, table counts, and approximate sizes
+  ${SCRIPT_NAME} users        List MariaDB accounts
+  ${SCRIPT_NAME} remote       Show live remote accounts and grants tracked here
+  ${SCRIPT_NAME} info         Show MariaDB server variables and listening socket
+  ${SCRIPT_NAME} diagnose     Explain whether MariaDB is listening for remote clients
+  ${SCRIPT_NAME} grant        Grant access to one database
+  ${SCRIPT_NAME} revoke       Revoke a database grant recorded by this tool
+  ${SCRIPT_NAME} remove-remote Remove a selected remote account and all its grants
+  ${SCRIPT_NAME} --version    Print the version
+  ${SCRIPT_NAME} --about      Print this guide
+  ${SCRIPT_NAME} --help       Print concise command help
+
+Interactive menu
+  Option 3 shows grants for any selected account.
+
+Grant behavior
+  - Select a database and an existing user@localhost identity.
+  - Add or reuse the matching user@'%' account. For a new account, enter the
+    password already configured by the application; a reused remote account
+    keeps its existing password.
+  - Grant ALL PRIVILEGES on the selected database only. The '%' host permits
+    login attempts from any source IP at the MariaDB account layer.
+  - The tool refuses when an existing remote account has global or role grants,
+    or database/object grants that already cover the selected database.
+
+Revoke and remove behavior
+  - 'revoke' affects only an exact database grant recorded by this tool.
+    It drops an account created by this tool only when no additional grants
+    exist; otherwise it keeps the account and removes the managed database grant.
+  - 'remove-remote' lists accounts whose Host is not 'localhost'. After showing
+    grants, it asks you to type DROP user@host exactly. This drops that account
+    and every grant attached to it. A same-name user@localhost is untouched.
+
+Network requirements
+  - MariaDB must listen on a reachable non-loopback address for remote access.
+  - The server firewall and any provider firewall must allow TCP to the MariaDB
+    port. This tool only diagnoses these settings; it never changes them.
+
+Requirements and state
+  - Bash, root access, the 'mariadb' client with local root socket access, and
+    'flock'. The 'ss' command improves socket diagnosis.
+  - The history and lock files live beside this script. History uses only the
+    current strict record format; there is no migration or old-format support.
+    Renaming or moving the script changes the history filename.
+  - Passwords are entered without echo and are never written to history.
+  - Interactive prompts accept 'back'/'b' and 'quit'/'q'; secret prompts use
+    ':back' and ':quit'.
+EOF_ABOUT
 }
 
 COMMAND=''
 case "${1:-}" in
     --version|-v)
-        printf '%s %s (edition %s, released %s)\n%s\n' "$SCRIPT_NAME" "$VERSION" "$EDITION" "$RELEASED" "$RELEASE_NOTES"
+        printf '%s %s (edition %s, released %s)\n' "$SCRIPT_NAME" "$VERSION" "$EDITION" "$RELEASED"
         exit 0
         ;;
     --help|-h) usage; exit 0 ;;
+    --about) about; exit 0 ;;
     ''|menu) COMMAND='menu' ;;
     databases|users|remote|info|diagnose|grant|revoke|remove-remote) COMMAND="$1" ;;
     *) err "Unknown option: $1"; usage >&2; exit 2 ;;

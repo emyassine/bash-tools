@@ -201,5 +201,18 @@ new_env; printf 'app\t%%\n' >>"$FAKE_DB_DIR/users"; run_cli 'app@%\nDROP\n' remo
 assert 'incorrect confirmation preserves account'   has_user app '%'
 assert 'incorrect confirmation executes no drop'    log_lacks '^DROP USER'
 
+section '14. Portable about and CLI help'
+new_env; run_cli '' --about
+assert 'about identifies the current version'          out_has 'mariadb-manager.sh 2.4.0'
+assert 'about documents database grants'              out_has 'Grant ALL PRIVILEGES on the selected database only'
+assert 'about documents full remote account removal'  out_has 'every grant attached to it'
+assert 'about documents network limits'               out_has 'firewalls'
+assert 'about does not connect to MariaDB'            log_lacks 'SELECT 1'
+run_cli '' --version
+assert 'version output is concise'                     out_lacks 'Grant behavior'
+assert 'version identifies 2.4.0'                     out_has '2.4.0'
+run_cli '' --help
+assert 'help points to the portable about guide'      out_has '--about'
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
